@@ -104,6 +104,88 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 | **Isolation Forests** | Unsupervised anomaly detection | Complements supervised models; detects novel/zero-day fraud patterns |
 | **Multilayer Perceptron (MLP)** | Captures complex feature interactions | Optimizable for GPU-accelerated real-time inference |
 
+### Self-Supervised Learning (Advanced)
+
+| Model | Key Strengths | Implementation Notes |
+|-------|---------------|---------------------|
+| **TabNet with Self-Supervised Pretraining** | Learns from unlabeled transactions via masked feature prediction; built-in attention-based interpretability | Pretrain on all transactions, fine-tune on labeled fraud cases; ONNX exportable for <50ms inference |
+| **SimCLR Contrastive Learning** | Learns dense transaction embeddings by maximizing agreement between augmented views of the same transaction | Embedding distances from legitimate cluster centroids serve as anomaly scores; plug into XGBoost/LightGBM as supplementary features |
+
+#### Why Self-Supervised Learning for Fraud Detection
+
+Fraud detection faces fundamental challenges that SSL directly addresses:
+
+| Challenge | How SSL Helps |
+|-----------|---------------|
+| **Extreme label scarcity** (0.17% fraud) | SSL pretrains on 100% of transactions—both labeled and unlabeled—learning robust representations of normal vs. anomalous behavior without needing fraud labels |
+| **Evolving fraud patterns** (zero-day attacks) | Contrastive learning builds a latent space where legitimate transactions cluster tightly; novel fraud patterns fall outside these clusters and are flagged as anomalies |
+| **Cold-start problem** | New fraud typologies with no historical examples are detectable via representation drift rather than waiting for labeled instances |
+| **Label noise** (delayed/misclassified chargebacks) | SSL representations are robust to label noise since the pretraining objective is label-free |
+
+#### SSL Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SSL PIPELINE                              │
+│                                                              │
+│  Phase 1: Pretraining (Unsupervised)                         │
+│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │
+│  │ All      │───▶│ Augmentation │───▶│ TabNet Encoder   │   │
+│  │ Trans-   │    │ • Masking    │    │ (Feature Mask    │   │
+│  │ actions  │    │ • Noise      │    │  Prediction)     │   │
+│  │ (284K)   │    │ • Permute    │    └────────┬─────────┘   │
+│  └──────────┘    └──────────────┘             │             │
+│                                                ▼             │
+│                                       ┌──────────────────┐   │
+│                                       │ Learned Latent   │   │
+│                                       │ Representation   │   │
+│                                       └────────┬─────────┘   │
+│                                                │             │
+│  Phase 2: Fine-tuning (Supervised)   ┌────────▼─────────┐   │
+│  ┌──────────┐                        │ Classification   │   │
+│  │ Labeled  │───────────────────────▶│ Head (Binary)    │───▶│
+│  │ Fraud    │                        └──────────────────┘   │
+│  │ Cases    │                                               │
+│  │ (492)    │  Phase 3: Output                              │
+│  └──────────┘  ┌──────────────────────────────────────┐    │
+│                │ • Fraud Probability Score (0–1)       │    │
+│                │ • Anomaly Score (distance from normal) │    │
+│                │ • Feature Attention Weights (SHAP)    │    │
+│                └──────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### SSL Implementation Strategy
+
+| Component | TabNet SSL | SimCLR Contrastive |
+|-----------|------------|---------------------|
+| **Pretraining Data** | All 284,807 transactions | All 284,807 transactions |
+| **Augmentation** | Random feature masking (20–50%) | Gaussian noise + feature dropout |
+| **Objective** | Reconstruct masked features | Maximize cosine similarity of augmented pairs |
+| **Output** | End-to-end fraud classifier | 128-dim embedding + anomaly score feature |
+| **Fine-tuning** | Train classification head on 492 fraud cases | Train linear probe on 492 fraud cases |
+| **Inference Latency** | <50ms (ONNX) | Embedding: <10ms (precomputed); downstream model adds <40ms |
+| **Interpretability** | Native attention masks per prediction | SHAP on final classifier using embedding features |
+
+#### Production Integration
+
+```
+Real-Time Authorization Flow:
+
+  Transaction ──▶ Feature Engineering ──▶ TabNet SSL Model ──▶ Fraud Score (0–1)
+                     │                                              │
+                     │                     ┌────────────────────────┘
+                     │                     │
+                     └──▶ SimCLR Embedding │──▶ Anomaly Score ──▶ Ensemble Decision
+                                           │                            │
+                                           └────────────────────────────┘
+                                                                        │
+                                                            ┌───────────▼──────────┐
+                                                            │ APPROVE / DECLINE /  │
+                                                            │ REVIEW               │
+                                                            └──────────────────────┘
+```
+
 ---
 
 ## Evaluation Metrics
@@ -111,6 +193,7 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 ### Technical Metrics (Primary)
 - **Precision-Recall AUC (PR-AUC)** — prioritized over ROC-AUC due to extreme class imbalance
 - **Recall @ Fixed False Positive Rate** (e.g., recall at 1% FPR)
+- **Anomaly Detection AUC** (for SSL models) — measures separation of normal vs. fraudulent embeddings
 
 ### Business Metrics
 | Metric | Description |
@@ -118,6 +201,7 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 | Fraud Value Saved ($) | Total monetary value of caught fraud |
 | False Positive Rate | Percentage of legitimate transactions incorrectly declined ("customer insult rate") |
 | Inference Latency (ms) | End-to-end prediction time, must stay within SLA |
+| Zero-Day Detection Rate | Percentage of novel fraud patterns caught without labeled examples |
 
 ---
 
@@ -149,8 +233,14 @@ python src/models/train_baseline.py --model logistic_regression
 # Train advanced model
 python src/models/train_advanced.py --model xgboost
 
+# Train self-supervised model
+python src/models/train_ssl.py --model tabnet --pretrain_epochs 100 --finetune_epochs 50
+
 # Evaluate
 python src/evaluation/evaluate.py --model-path models/xgboost.pkl
+
+# Evaluate SSL model
+python src/evaluation/evaluate.py --model-path models/tabnet_ssl.pkl --include-embedding-metrics
 ```
 
 ---
@@ -164,6 +254,9 @@ python src/evaluation/evaluate.py --model-path models/xgboost.pkl
 - pandas, numpy
 - ONNX Runtime (inference optimization)
 - MLflow (experiment tracking)
+- PyTorch / TensorFlow (SSL models)
+- pytorch-tabnet (TabNet implementation)
+- lightly / solo-learn (contrastive learning frameworks)
 
 ---
 
@@ -171,10 +264,10 @@ python src/evaluation/evaluate.py --model-path models/xgboost.pkl
 
 | Requirement | Specification |
 |-------------|---------------|
-| Inference Latency | ≤ 100ms end-to-end |
-| Model Interpretability | Required for regulatory/adverse action notices |
+| Inference Latency | ≤ 100ms end-to-end (SSL embeddings precomputed in online feature store) |
+| Model Interpretability | Required for regulatory/adverse action notices (TabNet provides native attention masks) |
 | Deployment Format | ONNX or high-performance C++ backend with Python wrapper |
-| Class Imbalance Handling | SMOTE, cost-sensitive learning, appropriate evaluation metrics |
+| Class Imbalance Handling | SMOTE, cost-sensitive learning, SSL pretraining on all data, appropriate evaluation metrics |
 
 ---
 
