@@ -189,7 +189,7 @@ python src/evaluation/evaluate.py --model-path models/xgboost.pkl
 
 ## License
 
-[Specify license — e.g., MIT, proprietary]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
