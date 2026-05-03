@@ -77,3 +77,4 @@ config/secrets.yaml
 .DS_Store
 Thumbs.db
 desktop.ini
+data/data_logging/
