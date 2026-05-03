@@ -1,0 +1,234 @@
+# ================================
+# Fraud Detection Pipeline Configuration
+# ================================
+# This file contains all paths, parameters, and settings
+# for the baseline ML pipeline. Update values as needed.
+
+# ================================
+# Project Paths
+# ================================
+paths:
+  data_dir: "data"
+  raw_data: "data/raw/creditcard.csv"
+  processed_dir: "data/processed"
+  cleaned_data: "data/processed/cleaned.parquet"
+  features_data: "data/processed/features.parquet"
+  train_data: "data/processed/train.parquet"
+  test_data: "data/processed/test.parquet"
+  monitoring_dir: "data/monitoring"
+  monitoring_data: "data/monitoring/new_transactions_labeled.csv"
+  artifacts_dir: "artifacts"
+  scaler: "artifacts/scaler.pkl"
+  feature_config: "artifacts/feature_config.json"
+  model: "artifacts/model.pkl"
+  model_metadata: "artifacts/model_metadata.json"
+  reports_dir: "reports"
+  validation_report: "reports/validation_report.json"
+  eda_dir: "reports/eda"
+  evaluation_report: "reports/evaluation_report.json"
+  confusion_matrix: "reports/confusion_matrix.csv"
+  monitoring_report: "reports/monitoring_report"
+  logs_dir: "logs"
+  service_log: "logs/service.log"
+
+# ================================
+# Data Ingestion
+# ================================
+ingestion:
+  file_format: "csv"
+  expected_rows: 284807
+  expected_columns: 31
+  column_names:
+    - "Time"
+    - "V1"
+    - "V2"
+    - "V3"
+    - "V4"
+    - "V5"
+    - "V6"
+    - "V7"
+    - "V8"
+    - "V9"
+    - "V10"
+    - "V11"
+    - "V12"
+    - "V13"
+    - "V14"
+    - "V15"
+    - "V16"
+    - "V17"
+    - "V18"
+    - "V19"
+    - "V20"
+    - "V21"
+    - "V22"
+    - "V23"
+    - "V24"
+    - "V25"
+    - "V26"
+    - "V27"
+    - "V28"
+    - "Amount"
+    - "Class"
+
+# ================================
+# Data Validation
+# ================================
+validation:
+  amount_min: 0.0
+  amount_max: 26000.0
+  class_values: [0, 1]
+  max_null_percentage: 0.0
+  check_duplicates: true
+  stop_on_failure: true
+
+# ================================
+# Data Preprocessing
+# ================================
+preprocessing:
+  scale_features:
+    - "Amount"
+    - "Time"
+  scaler_type: "standard"           # Options: standard, robust, minmax
+  pca_features_null_fill: 0.0       # Fill value for PCA features if null
+  amount_null_strategy: "median"    # Options: median, mean, zero
+  remove_duplicates: true
+  log_transform_amount: true        # Creates Amount_log = log(Amount + 1)
+
+# ================================
+# Feature Engineering
+# ================================
+feature_engineering:
+  time_features:
+    extract_hour: true
+    extract_day: true
+    cyclical_encoding: true         # Creates hour_sin, hour_cos
+  velocity_features:
+    enabled: true
+    windows:
+      - name: "1h"
+        seconds: 3600
+      - name: "24h"
+        seconds: 86400
+    metrics:
+      - "count"                     # txn_count_{window}
+      - "mean"                      # avg_amount_{window}
+      - "std"                       # std_amount_{window}
+  amount_transform:
+    log_transform: true             # Amount_log = log(Amount + 1)
+  feature_selection:
+    enabled: false                  # Set to true to keep only top N features
+    top_n_correlated: 15            # Keep top 15 features correlated with Class
+    top_features:
+      - "V17"
+      - "V14"
+      - "V12"
+      - "V10"
+      - "V16"
+      - "V3"
+      - "V7"
+      - "V11"
+      - "V4"
+      - "V18"
+  drop_columns:
+    - "Time"                        # Dropped after feature engineering
+
+# ================================
+# Data Splitting
+# ================================
+splitting:
+  strategy: "time_aware"            # Options: time_aware, random, stratified
+  train_ratio: 0.80
+  time_column: "Time"
+  sort_by_time: true
+  save_split_timestamp: true
+
+# ================================
+# Model Training
+# ================================
+training:
+  target_column: "Class"
+  imbalance_handling:
+    method: "smote"                 # Options: smote, class_weight, none
+    random_state: 42
+  cross_validation:
+    n_folds: 3
+    scoring: "average_precision"    # PR-AUC for imbalanced data
+    shuffle: false                  # Time-series: no shuffle
+  models:
+    logistic_regression:
+      enabled: true
+      params:
+        max_iter: 1000
+        class_weight: "balanced"    # Fallback if SMOTE not used
+        random_state: 42
+    decision_tree:
+      enabled: true
+      params:
+        max_depth: 5
+        class_weight: "balanced"
+        random_state: 42
+    random_forest:
+      enabled: true
+      params:
+        n_estimators: 50
+        max_depth: 10
+        class_weight: "balanced"
+        random_state: 42
+        n_jobs: -1                  # Use all CPU cores
+
+# ================================
+# Model Evaluation
+# ================================
+evaluation:
+  primary_metric: "pr_auc"          # Precision-Recall AUC
+  secondary_metrics:
+    - "roc_auc"
+    - "precision"
+    - "recall"
+    - "f1"
+  threshold_tuning:
+    target_recall: 0.80             # Find threshold for 80% recall
+    target_fpr: 0.01                # Find threshold for 1% false positive rate
+  default_threshold: 0.5
+
+# ================================
+# Model Deployment
+# ================================
+deployment:
+  host: "0.0.0.0"
+  port: 5000
+  debug: true                       # Set to false for production simulation
+  threshold: 0.80                   # Default decision threshold (override from evaluation)
+  log_requests: true
+  response_fields:
+    - "fraud_probability"
+    - "is_fraud"
+    - "threshold"
+
+# ================================
+# Monitoring & Maintenance
+# ================================
+monitoring:
+  enabled: true
+  new_data_path: "data/monitoring/new_transactions_labeled.csv"
+  compare_metrics:
+    - "pr_auc"
+    - "false_positive_rate"
+  drift_thresholds:
+    fpr_increase_pct: 20.0          # Alert if FPR increases >20%
+    pr_auc_decrease_pct: 10.0       # Alert if PR-AUC drops >10%
+
+# ================================
+# Logging
+# ================================
+logging:
+  level: "INFO"                     # Options: DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_logging: true
+  console_logging: true
+
+# ================================
+# Random Seed
+# ================================
+random_state: 42
