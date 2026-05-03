@@ -1,0 +1,79 @@
+# ================================
+# Python
+# ================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+venv/
+.venv/
+env/
+.env/
+
+# ================================
+# Jupyter Notebooks
+# ================================
+.ipynb_checkpoints/
+*.ipynb
+
+# ================================
+# Data Files
+# ================================
+data/raw/*
+data/processed/*
+data/monitoring/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/monitoring/.gitkeep
+
+# ================================
+# Artifacts (Models, Scalers, Configs)
+# ================================
+artifacts/*
+!artifacts/.gitkeep
+
+# ================================
+# Reports
+# ================================
+reports/*
+!reports/.gitkeep
+!reports/eda/.gitkeep
+
+# ================================
+# Logs
+# ================================
+logs/*
+!logs/.gitkeep
+*.log
+
+# ================================
+# IDE and Editor
+# ================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ================================
+# Environment and Secrets
+# ================================
+.env
+.env.*
+*.env
+config/secrets.yaml
+
+# ================================
+# OS Files
+# ================================
+.DS_Store
+Thumbs.db
+desktop.ini
