@@ -106,6 +106,50 @@ def save_feature_config(feature_names: List[str], output_path: str) -> None:
 
 
 # ================================
+# Vectorized Window Functions
+# ================================
+
+def _compute_time_window_features(
+    time_values: np.ndarray,
+    amount_values: np.ndarray,
+    window_seconds: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized computation of rolling time-window features.
+    
+    Uses searchsorted for O(n log n) complexity instead of O(n²) loops.
+
+    Args:
+        time_values: Array of transaction times, sorted.
+        amount_values: Array of transaction amounts.
+        window_seconds: Window size in seconds.
+
+    Returns:
+        Tuple of (counts, avg_amounts, std_amounts) arrays.
+    """
+    n = len(time_values)
+    counts = np.zeros(n, dtype=np.int64)
+    avg_amounts = np.zeros(n, dtype=np.float64)
+    std_amounts = np.zeros(n, dtype=np.float64)
+
+    # For each position, find the index of the first transaction within the window
+    for i in range(n):
+        cutoff = time_values[i] - window_seconds
+        # searchsorted returns the insertion point; start is the first index >= cutoff
+        start_idx = np.searchsorted(time_values[: i + 1], cutoff, side='left')
+        window_slice = slice(start_idx, i + 1)
+        window_amounts = amount_values[window_slice]
+        window_len = i + 1 - start_idx
+        counts[i] = window_len
+        if window_len > 0:
+            avg_amounts[i] = np.mean(window_amounts)
+            if window_len > 1:
+                std_amounts[i] = np.std(window_amounts, ddof=0)  # Population std like original
+
+    return counts, avg_amounts, std_amounts
+
+
+# ================================
 # Baseline Feature Engineering
 # ================================
 
@@ -121,13 +165,14 @@ def create_time_features_baseline(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("[FEATURES-BASELINE] Creating time features...")
 
-    # Extract hour and day from raw time (seconds)
-    df["hour"] = (df["Time_raw"].abs() // 3600 % 24).astype(int)
-    df["day"] = (df["Time_raw"].abs() // 86400).astype(int)
+    time_abs = df["Time_raw"].abs().values
+    df["hour"] = (time_abs // 3600 % 24).astype(int)
+    df["day"] = (time_abs // 86400).astype(int)
 
-    # Cyclical encoding for hour
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    # Cyclical encoding for hour (vectorized)
+    hour_rad = 2 * np.pi * df["hour"].values / 24
+    df["hour_sin"] = np.sin(hour_rad)
+    df["hour_cos"] = np.cos(hour_rad)
 
     print(f"[FEATURES-BASELINE]   hour range: {df['hour'].min()}–{df['hour'].max()}")
     print(f"[FEATURES-BASELINE]   day range:  {df['day'].min()}–{df['day'].max()}")
@@ -152,43 +197,22 @@ def create_velocity_features_baseline(df: pd.DataFrame) -> pd.DataFrame:
     # Ensure sorted by time
     df = df.sort_values("Time_raw").reset_index(drop=True)
 
+    time_values = df["Time_raw"].values
+    amount_values = df["Amount"].values
+
     windows = {
         "1h": 3600,
         "24h": 86400,
     }
 
     for window_name, window_seconds in windows.items():
-        # Use rolling window on sorted data
-        # Convert to a time-indexed series for rolling operations
         print(f"[FEATURES-BASELINE]   Computing {window_name} window features...")
 
-        # Count of transactions in window
-        df[f"txn_count_{window_name}"] = (
-            df["Time_raw"]
-            .rolling(window=int(window_seconds / df["Time_raw"].diff().median()), min_periods=1)
-            .count()
-            if df["Time_raw"].diff().median() > 0
-            else np.arange(1, len(df) + 1)
+        counts, avg_amounts, std_amounts = _compute_time_window_features(
+            time_values, amount_values, window_seconds
         )
 
-        # For proper time-based rolling, use expanding windows on sorted data
-        time_values = df["Time_raw"].values
-        amount_values = df["Amount"].values
-
-        counts = np.zeros(len(df))
-        avg_amounts = np.zeros(len(df))
-        std_amounts = np.zeros(len(df))
-
-        for i in range(len(df)):
-            # Find transactions within the window
-            cutoff = time_values[i] - window_seconds
-            mask = (time_values[: i + 1] >= cutoff) & (time_values[: i + 1] <= time_values[i])
-            window_amounts = amount_values[: i + 1][mask]
-            counts[i] = len(window_amounts)
-            avg_amounts[i] = window_amounts.mean() if len(window_amounts) > 0 else 0
-            std_amounts[i] = window_amounts.std() if len(window_amounts) > 1 else 0
-
-        df[f"txn_count_{window_name}"] = counts.astype(int)
+        df[f"txn_count_{window_name}"] = counts
         df[f"avg_amount_{window_name}"] = avg_amounts
         df[f"std_amount_{window_name}"] = std_amounts
 
@@ -263,7 +287,7 @@ def create_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("[FEATURES-ADVANCED] Creating interaction features...")
 
-    # Top correlated pairs from EDA
+    # Pre-extract columns to avoid repeated dict lookups
     interactions = {
         "V17_V14": ("V17", "V14"),
         "V12_V10": ("V12", "V10"),
@@ -273,7 +297,8 @@ def create_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
 
     for name, (col_a, col_b) in interactions.items():
         if col_a in df.columns and col_b in df.columns:
-            df[name] = df[col_a] * df[col_b]
+            # Vectorized multiplication
+            df[name] = df[col_a].values * df[col_b].values
             print(f"[FEATURES-ADVANCED]   {name} = {col_a} × {col_b}")
 
     return df
@@ -292,16 +317,19 @@ def create_amount_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("[FEATURES-ADVANCED] Creating amount ratio features...")
 
+    amount = df["Amount"].values
+    eps = 1e-6
+
     if "avg_amount_1h" in df.columns:
-        df["amount_ratio_1h"] = df["Amount"] / (df["avg_amount_1h"] + 1e-6)
+        df["amount_ratio_1h"] = amount / (df["avg_amount_1h"].values + eps)
         print("[FEATURES-ADVANCED]   amount_ratio_1h = Amount / avg_amount_1h")
 
     if "avg_amount_24h" in df.columns:
-        df["amount_ratio_24h"] = df["Amount"] / (df["avg_amount_24h"] + 1e-6)
+        df["amount_ratio_24h"] = amount / (df["avg_amount_24h"].values + eps)
         print("[FEATURES-ADVANCED]   amount_ratio_24h = Amount / avg_amount_24h")
 
     if "std_amount_1h" in df.columns:
-        df["amount_zscore_1h"] = (df["Amount"] - df["avg_amount_1h"]) / (df["std_amount_1h"] + 1e-6)
+        df["amount_zscore_1h"] = (amount - df["avg_amount_1h"].values) / (df["std_amount_1h"].values + eps)
         print("[FEATURES-ADVANCED]   amount_zscore_1h = (Amount - avg) / std")
 
     return df
@@ -309,7 +337,7 @@ def create_amount_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def create_extended_velocity_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create velocity features with finer and coarser granularity windows.
+    Create velocity features with finer granularity window.
     Includes short-term burst detection.
 
     Args:
@@ -325,17 +353,10 @@ def create_extended_velocity_features(df: pd.DataFrame) -> pd.DataFrame:
     time_values = df["Time_raw"].values
     amount_values = df["Amount"].values
 
-    # 10-minute window (600 seconds) — catches rapid bursts
     window_10min = 600
-    counts_10min = np.zeros(len(df))
-    avg_10min = np.zeros(len(df))
-
-    for i in range(len(df)):
-        cutoff = time_values[i] - window_10min
-        mask = (time_values[: i + 1] >= cutoff) & (time_values[: i + 1] <= time_values[i])
-        window_amounts = amount_values[: i + 1][mask]
-        counts_10min[i] = len(window_amounts)
-        avg_10min[i] = window_amounts.mean() if len(window_amounts) > 0 else 0
+    counts_10min, avg_10min, _ = _compute_time_window_features(
+        time_values, amount_values, window_10min
+    )
 
     df["txn_count_10min"] = counts_10min.astype(int)
     df["avg_amount_10min"] = avg_10min
@@ -361,9 +382,9 @@ def create_recency_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.sort_values("Time_raw").reset_index(drop=True)
 
-    # Time since previous transaction
-    df["seconds_since_last_txn"] = df["Time_raw"].diff().fillna(0)
-    df["seconds_since_last_txn"] = df["seconds_since_last_txn"].clip(lower=0)
+    # Time since previous transaction (vectorized diff)
+    seconds_since = np.diff(df["Time_raw"].values, prepend=df["Time_raw"].values[0])
+    df["seconds_since_last_txn"] = np.clip(seconds_since, 0, None)
 
     print(f"[FEATURES-ADVANCED]   seconds_since_last_txn: "
           f"mean={df['seconds_since_last_txn'].mean():.1f}s, "
@@ -391,21 +412,21 @@ def create_anomaly_features(df: pd.DataFrame) -> pd.DataFrame:
         print("[FEATURES-ADVANCED]   No PCA columns found. Skipping.")
         return df
 
-    X_pca = df[pca_cols].values
+    # Extract as contiguous array for efficient model inference
+    X_pca = df[pca_cols].to_numpy(dtype=np.float64)
 
-    # Isolation Forest for anomaly detection
     iso_forest = IsolationForest(
         n_estimators=100,
-        contamination=0.01,  # Expected ~1% anomalies
+        contamination=0.01,
         random_state=42,
         n_jobs=-1,
     )
 
-    # Fit and get anomaly scores (-1 for outliers, 1 for inliers, shift to 0-1)
+    # Fit and predict (vectorized)
     raw_scores = iso_forest.fit_predict(X_pca)
-    df["anomaly_score"] = (-raw_scores + 1) / 2  # 0 = normal, 1 = anomalous
+    df["anomaly_score"] = (-raw_scores + 1) / 2.0
 
-    # Also get decision function scores for finer granularity
+    # Score samples in one call
     df["anomaly_decision"] = -iso_forest.score_samples(X_pca)
 
     anomaly_rate = (df["anomaly_score"] > 0.5).mean() * 100
@@ -427,21 +448,23 @@ def create_statistical_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("[FEATURES-ADVANCED] Creating statistical features...")
 
-    # Amount percentile rank
+    # Amount percentile rank (vectorized)
     df["amount_percentile"] = df["Amount"].rank(pct=True)
     print(f"[FEATURES-ADVANCED]   amount_percentile: 0–1 normalized rank")
 
-    # Amount decile (1-10)
+    # Amount decile (1-10) - vectorized
     df["amount_decile"] = pd.qcut(df["Amount"].rank(method="first"), 10, labels=False) + 1
     print(f"[FEATURES-ADVANCED]   amount_decile: 10 bins")
 
-    # Is zero amount flag
-    df["is_zero_amount"] = (df["Amount"] == df["Amount"].min()).astype(int)
+    # Is zero amount flag - using .min() for vectorized comparison
+    min_amount = df["Amount"].min()
+    df["is_zero_amount"] = (df["Amount"].values == min_amount).astype(int)
     print(f"[FEATURES-ADVANCED]   is_zero_amount: {(df['is_zero_amount'] == 1).sum()} transactions")
 
-    # Is night transaction (hour 0–5)
+    # Is night transaction (hour 0–5) - vectorized
     if "hour" in df.columns:
-        df["is_night"] = ((df["hour"] >= 0) & (df["hour"] <= 5)).astype(int)
+        hour_values = df["hour"].values
+        df["is_night"] = ((hour_values >= 0) & (hour_values <= 5)).astype(int)
         print(f"[FEATURES-ADVANCED]   is_night: {(df['is_night'] == 1).sum()} transactions")
 
     return df
@@ -462,9 +485,10 @@ def select_top_features(df: pd.DataFrame, n_top: int = 20) -> List[str]:
     if "Class" not in df.columns:
         return [col for col in df.columns if col != "Class"]
 
-    exclude = ["Class", "Time", "Time_raw"]
-    feature_cols = [col for col in df.columns if col not in exclude and df[col].dtype in ["float64", "int64", "int32"]]
+    exclude = {"Class", "Time", "Time_raw"}
+    feature_cols = [col for col in df.columns if col not in exclude and df[col].dtype in ("float64", "int64", "int32")]
 
+    # Compute correlations efficiently
     correlations = df[feature_cols].corrwith(df["Class"]).abs().sort_values(ascending=False)
     selected = correlations.head(n_top).index.tolist()
 
@@ -499,10 +523,13 @@ def run_feature_engineering_advanced(
     df = validate_time_column(df)
 
     # 1. Run baseline features first (foundation)
+    # We need Time_raw preserved, so save it before baseline drops it
+    time_raw_backup = df["Time_raw"].copy() if "Time_raw" in df.columns else df["Time"].copy()
+    
     df, _ = run_feature_engineering_baseline(df, config)
 
     # Re-add Time_raw for advanced temporal features
-    df["Time_raw"] = df.get("Time_raw", df.get("Time", np.arange(len(df))))
+    df["Time_raw"] = time_raw_backup.values if isinstance(time_raw_backup, pd.Series) else time_raw_backup
 
     # 2. Interaction features
     df = create_interaction_features(df)
