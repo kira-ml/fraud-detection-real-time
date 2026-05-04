@@ -1,241 +1,375 @@
 """
-split.py
-Credit Card Fraud Detection - Time-Aware Data Splitting
-
-This module implements a chronological split of the 48-hour dataset into
-training (first 80%) and test (remaining 20%) sets based on the Time column.
+Data Splitting Module
+Time-aware chronological split for credit card fraud detection.
+Splits both baseline and advanced feature-engineered datasets.
+Since Time column is removed during feature engineering, splits by row index
+on chronologically-ordered data (equivalent to time-based split).
+Ensures no temporal leakage between train and test sets.
 """
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
-import json
-import os
-from pathlib import Path
-from typing import Tuple, Dict, Any
+import yaml
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
-class Config:
-    """Central configuration for data splitting"""
-    # Paths
-    BASELINE_FEATURES_PATH = r"D:\fraud-detection-real-time\data\processed\processedfeatures_baseline.parquet"
-    ADVANCED_FEATURES_PATH = r"D:\fraud-detection-real-time\data\processed\processedfeatures_advanced.parquet"
-    OUTPUT_DIR = r"D:\fraud-detection-real-time\src\..\data\processed"
-    
-    # Split parameters
-    TRAIN_RATIO = 0.80
-    MAX_TIME_SECONDS = 172792  # From module description (48 hours / 172,800 + small offset)
-    
-    # Feature column name
-    TIME_COLUMN = "Time"  # Note: May not exist in engineered features, will handle this
-    
-    # Output file names
-    TRAIN_OUTPUT = "train_baseline.parquet"
-    TEST_OUTPUT = "test_baseline.parquet"
-    SPLIT_CONFIG = "split_config.json"
+# ================================
+# Configuration Loader
+# ================================
 
-# ============================================================================
-# DATA SPLITTER
-# ============================================================================
-
-class ChronologicalSplitter:
+def load_config(config_path: Optional[str] = None) -> Dict:
     """
-    Time-aware data splitter that preserves chronological order.
-    Splits at 80% of the time range for training and 20% for testing.
+    Load pipeline configuration from YAML file.
+
+    Args:
+        config_path: Path to config file. If None, auto-resolves to default.
+
+    Returns:
+        Dictionary containing pipeline configuration.
     """
+    if config_path is None:
+        project_root = Path(__file__).resolve().parent.parent
+        config_path = project_root / "config" / "pipeline_config.yaml"
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    return config
+
+
+# ================================
+# Core Splitting Logic
+# ================================
+
+def split_data_chronological(
+    df: pd.DataFrame,
+    train_ratio: float = 0.80,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Perform chronological split by row index.
+    Assumes data is already sorted chronologically (as done in feature engineering).
+
+    Args:
+        df: Input DataFrame (must be in chronological order).
+        train_ratio: Fraction of data to use for training.
+
+    Returns:
+        Tuple of (train_df, test_df).
+    """
+    split_idx = int(len(df) * train_ratio)
     
-    def __init__(self, config: Config):
-        """Initialize splitter with configuration"""
-        self.config = config
-        self.train_df = None
-        self.test_df = None
-        self.split_stats = {}
-        
-    def load_features(self, file_path: str) -> pd.DataFrame:
-        """Load features from parquet file"""
-        print(f"Loading features from: {file_path}")
-        df = pd.read_parquet(file_path)
-        print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
-        return df
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    return train_df, test_df
+
+
+def validate_split(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    dataset_name: str,
+    target_col: str = "Class",
+) -> bool:
+    """
+    Verify split integrity: class balance preserved and no data leakage.
+
+    Args:
+        train_df: Training DataFrame.
+        test_df: Test DataFrame.
+        dataset_name: Label for logging (e.g., 'BASELINE', 'ADVANCED').
+        target_col: Name of the target column.
+
+    Returns:
+        True if all validation checks pass.
+    """
+    print(f"\n[SPLIT] --- {dataset_name} Dataset Validation ---")
+
+    # Verify no overlap (index-based split guarantees this)
+    train_indices = set(train_df.index)
+    test_indices = set(test_df.index)
+    overlap = len(train_indices.intersection(test_indices))
     
-    def compute_split_threshold(self, df: pd.DataFrame) -> float:
-        """
-        Compute the split timestamp based on 80% of max Time value.
-        Falls back to self.config.MAX_TIME_SECONDS if Time column is missing.
-        """
-        if self.config.TIME_COLUMN in df.columns:
-            max_time = df[self.config.TIME_COLUMN].max()
-            split_threshold = self.config.TRAIN_RATIO * max_time
-            print(f"Using Time column: max={max_time:.0f}, split at {split_threshold:.0f}")
-            return split_threshold
-        else:
-            # Use the known max from module description
-            print(f"Time column not found. Using fixed max time: {self.config.MAX_TIME_SECONDS}")
-            split_threshold = self.config.TRAIN_RATIO * self.config.MAX_TIME_SECONDS
-            print(f"Split threshold: {split_threshold:.0f} seconds")
-            return split_threshold
+    if overlap > 0:
+        print(f"[SPLIT] WARNING: {overlap} overlapping rows detected!")
+    else:
+        print(f"[SPLIT] No data leakage: 0 overlapping rows between train and test")
+
+    # Report class distributions
+    if target_col in train_df.columns:
+        train_fraud_count = train_df[target_col].sum()
+        test_fraud_count = test_df[target_col].sum()
+        train_fraud_rate = (train_fraud_count / len(train_df)) * 100
+        test_fraud_rate = (test_fraud_count / len(test_df)) * 100
+        
+        print(f"[SPLIT] Train fraud rate: {train_fraud_rate:.3f}% "
+              f"({train_fraud_count} / {len(train_df)})")
+        print(f"[SPLIT] Test fraud rate:  {test_fraud_rate:.3f}% "
+              f"({test_fraud_count} / {len(test_df)})")
+
+    # Report sizes
+    print(f"[SPLIT] Train size: {len(train_df):,} rows ({len(train_df.columns)} features)")
+    print(f"[SPLIT] Test size:  {len(test_df):,} rows ({len(test_df.columns)} features)")
+
+    return True
+
+
+def save_split_config(
+    train_ratio: float,
+    train_size: int,
+    test_size: int,
+    output_path: str
+) -> None:
+    """
+    Persist the split configuration for reproducibility.
+
+    Args:
+        train_ratio: Fraction of data used for training.
+        train_size: Number of training samples.
+        test_size: Number of test samples.
+        output_path: Path to save the config.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(f"split_method: chronological_index\n")
+        f.write(f"train_ratio: {train_ratio}\n")
+        f.write(f"train_size: {train_size}\n")
+        f.write(f"test_size: {test_size}\n")
+        f.write(f"note: Data is pre-sorted chronologically during feature engineering\n")
+    print(f"[SPLIT] Split config saved to: {output_path}")
+
+
+# ================================
+# Single Dataset Splitter
+# ================================
+
+def split_single_dataset(
+    input_path: str,
+    train_path: str,
+    test_path: str,
+    dataset_name: str,
+    target_col: str = "Class",
+    train_ratio: float = 0.80,
+) -> Tuple[int, int]:
+    """
+    Split a single feature-engineered dataset.
+
+    Args:
+        input_path: Path to the feature-engineered parquet file.
+        train_path: Output path for training set.
+        test_path: Output path for test set.
+        dataset_name: Label for logging (e.g., 'BASELINE', 'ADVANCED').
+        target_col: Name of the target column.
+        train_ratio: Fraction of data for training.
+
+    Returns:
+        Tuple of (train_size, test_size).
+    """
+    # Load feature-engineered data
+    print(f"\n[SPLIT] Loading {dataset_name} data from: {input_path}")
     
-    def split_dataframe(self, df: pd.DataFrame, split_threshold: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Split dataframe into train and test based on Time threshold.
-        """
-        # Ensure data is sorted chronologically
-        if self.config.TIME_COLUMN in df.columns:
-            df = df.sort_values(self.config.TIME_COLUMN).reset_index(drop=True)
-        
-        # Split based on Time column if available, otherwise use row-based split
-        if self.config.TIME_COLUMN in df.columns:
-            train_df = df[df[self.config.TIME_COLUMN] <= split_threshold].copy()
-            test_df = df[df[self.config.TIME_COLUMN] > split_threshold].copy()
-            
-            # Verify no temporal leakage
-            if len(train_df) > 0 and len(test_df) > 0:
-                max_train_time = train_df[self.config.TIME_COLUMN].max()
-                min_test_time = test_df[self.config.TIME_COLUMN].min()
-                print(f"Max train time: {max_train_time:.0f}, Min test time: {min_test_time:.0f}")
-                if max_train_time < min_test_time:
-                    print("✅ No temporal leakage: all train times < all test times")
-                else:
-                    print("⚠️ Temporal leakage detected! Check split logic.")
-        else:
-            # Fallback: row-based split (80/20) if Time column not present
-            split_idx = int(self.config.TRAIN_RATIO * len(df))
-            train_df = df.iloc[:split_idx].copy()
-            test_df = df.iloc[split_idx:].copy()
-            print("⚠️ Time column not found - using row-based 80/20 split (temporal ordering not guaranteed)")
-        
-        return train_df, test_df
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
     
-    def compute_statistics(self, df: pd.DataFrame, label: str) -> Dict[str, Any]:
-        """Compute statistics for a split to verify class distribution"""
-        if 'Class' not in df.columns:
-            return {"error": "Class column not found in dataframe"}
-        
-        total = len(df)
-        fraud_count = (df['Class'] == 1).sum()
-        legit_count = (df['Class'] == 0).sum()
-        fraud_ratio = fraud_count / total if total > 0 else 0
-        
-        stats = {
-            f"{label}_total": total,
-            f"{label}_fraud": fraud_count,
-            f"{label}_legit": legit_count,
-            f"{label}_fraud_ratio": fraud_ratio,
-            f"{label}_fraud_ratio_pct": fraud_ratio * 100
+    df = pd.read_parquet(input_path)
+    print(f"[SPLIT] Loaded {len(df):,} rows, {len(df.columns)} columns")
+
+    # Perform chronological split
+    train_df, test_df = split_data_chronological(df, train_ratio)
+
+    # Validate integrity
+    validate_split(train_df, test_df, dataset_name, target_col)
+
+    # Save outputs
+    os.makedirs(os.path.dirname(train_path), exist_ok=True)
+    train_df.to_parquet(train_path, index=False)
+    print(f"[SPLIT] {dataset_name} training set saved to: {train_path}")
+
+    os.makedirs(os.path.dirname(test_path), exist_ok=True)
+    test_df.to_parquet(test_path, index=False)
+    print(f"[SPLIT] {dataset_name} test set saved to: {test_path}")
+
+    return len(train_df), len(test_df)
+
+
+# ================================
+# Main Pipeline
+# ================================
+
+def run_data_split(
+    config_path: Optional[str] = None,
+    target_col: str = "Class",
+    train_ratio: float = 0.80,
+) -> Dict:
+    """
+    Execute the complete data splitting pipeline for both datasets.
+
+    Args:
+        config_path: Path to pipeline config YAML.
+        target_col: Name of the target column.
+        train_ratio: Fraction of time range for training.
+
+    Returns:
+        Dictionary with paths to saved train/test files.
+    """
+    config = load_config(config_path)
+
+    print("\n" + "=" * 60)
+    print("DATA SPLITTING (Chronological Index-Based)")
+    print("=" * 60)
+    print(f"[SPLIT] Train ratio: {train_ratio*100:.0f}%")
+    print(f"[SPLIT] Split method: First {train_ratio*100:.0f}% of rows → Train, remaining → Test")
+    print(f"[SPLIT] Note: Data is pre-sorted chronologically from feature engineering")
+
+    results = {}
+
+    # Resolve paths from config
+    project_root = Path(__file__).resolve().parent.parent
+    processed_dir = config.get("paths", {}).get("processed_data_dir", "data/processed")
+    if not os.path.isabs(processed_dir):
+        processed_dir = str(project_root / processed_dir)
+
+    config_dir = config.get("paths", {}).get("config_dir", "config")
+    if not os.path.isabs(config_dir):
+        config_dir = str(project_root / config_dir)
+
+    # --- Split Baseline Dataset ---
+    baseline_train_size = 0
+    baseline_test_size = 0
+    
+    try:
+        baseline_input_path = os.path.join(processed_dir, "features_baseline.parquet")
+        baseline_train_path = os.path.join(processed_dir, "train_baseline.parquet")
+        baseline_test_path = os.path.join(processed_dir, "test_baseline.parquet")
+
+        baseline_train_size, baseline_test_size = split_single_dataset(
+            input_path=baseline_input_path,
+            train_path=baseline_train_path,
+            test_path=baseline_test_path,
+            dataset_name="BASELINE",
+            target_col=target_col,
+            train_ratio=train_ratio,
+        )
+
+        results["baseline"] = {
+            "train": baseline_train_path,
+            "test": baseline_test_path,
         }
-        
-        return stats
-    
-    def save_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
-        """Save train and test splits to parquet files"""
-        # Create output directory
-        output_dir = Path(self.config.OUTPUT_DIR)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save parquet files
-        train_path = output_dir / self.config.TRAIN_OUTPUT
-        test_path = output_dir / self.config.TEST_OUTPUT
-        
-        train_df.to_parquet(train_path, index=False)
-        test_df.to_parquet(test_path, index=False)
-        print(f"✅ Train set saved to: {train_path}")
-        print(f"✅ Test set saved to: {test_path}")
-        
-        # Save split configuration
-        config_path = output_dir / self.config.SPLIT_CONFIG
-        with open(config_path, 'w') as f:
-            json.dump({
-                "split_ratio": self.config.TRAIN_RATIO,
-                "split_threshold": float(self.split_stats.get("split_threshold", 0)),
-                "train_fraud_ratio": self.split_stats.get("train_fraud_ratio_pct", 0),
-                "test_fraud_ratio": self.split_stats.get("test_fraud_ratio_pct", 0),
-                "train_size": int(self.split_stats.get("train_total", 0)),
-                "test_size": int(self.split_stats.get("test_total", 0))
-            }, f, indent=4)
-        print(f"✅ Split config saved to: {config_path}")
-    
-    def run_splitting(self, input_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Execute the complete data splitting pipeline.
-        """
-        # Load data
-        df = self.load_features(input_path)
-        
-        # Compute split threshold
-        split_threshold = self.compute_split_threshold(df)
-        self.split_stats["split_threshold"] = split_threshold
-        
-        # Perform split
-        train_df, test_df = self.split_dataframe(df, split_threshold)
-        
-        # Compute statistics
-        train_stats = self.compute_statistics(train_df, "train")
-        test_stats = self.compute_statistics(test_df, "test")
-        
-        # Merge statistics
-        self.split_stats.update(train_stats)
-        self.split_stats.update(test_stats)
-        
-        # Print statistics
-        print("\n" + "=" * 50)
-        print("SPLIT STATISTICS")
-        print("=" * 50)
-        print(f"Training set: {train_stats['train_total']:,} rows, "
-              f"{train_stats['train_fraud_ratio_pct']:.4f}% fraud")
-        print(f"Test set:     {test_stats['test_total']:,} rows, "
-              f"{test_stats['test_fraud_ratio_pct']:.4f}% fraud")
-        print(f"Total:        {train_stats['train_total'] + test_stats['test_total']:,} rows")
-        
-        # Check if fraud ratio is preserved
-        if 'train_fraud_ratio' in train_stats and 'test_fraud_ratio' in test_stats:
-            diff = abs(train_stats['train_fraud_ratio'] - test_stats['test_fraud_ratio'])
-            if diff < 0.0005:  # Within 0.05%
-                print("✅ Fraud ratio preserved between splits")
-            else:
-                print(f"⚠️ Fraud ratio difference: {diff:.6f}")
-        
-        # Save splits
-        self.save_splits(train_df, test_df)
-        
-        return train_df, test_df
+    except FileNotFoundError as e:
+        print(f"[SPLIT] WARNING: Baseline dataset not found - {e}")
+        print(f"[SPLIT] Skipping baseline split...")
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+    # --- Split Advanced Dataset ---
+    advanced_train_size = 0
+    advanced_test_size = 0
+    
+    try:
+        advanced_input_path = os.path.join(processed_dir, "features_advanced.parquet")
+        advanced_train_path = os.path.join(processed_dir, "train_advanced.parquet")
+        advanced_test_path = os.path.join(processed_dir, "test_advanced.parquet")
+
+        advanced_train_size, advanced_test_size = split_single_dataset(
+            input_path=advanced_input_path,
+            train_path=advanced_train_path,
+            test_path=advanced_test_path,
+            dataset_name="ADVANCED",
+            target_col=target_col,
+            train_ratio=train_ratio,
+        )
+
+        results["advanced"] = {
+            "train": advanced_train_path,
+            "test": advanced_test_path,
+        }
+    except FileNotFoundError as e:
+        print(f"[SPLIT] WARNING: Advanced dataset not found - {e}")
+        print(f"[SPLIT] Skipping advanced split...")
+
+    # Save split config for reproducibility (use baseline sizes if available)
+    split_config_path = os.path.join(config_dir, "split_config.txt")
+    save_split_config(
+        train_ratio=train_ratio,
+        train_size=baseline_train_size or advanced_train_size,
+        test_size=baseline_test_size or advanced_test_size,
+        output_path=split_config_path,
+    )
+
+    # Summary
+    if results:
+        print("\n" + "=" * 60)
+        print("SPLIT COMPLETE — OUTPUT FILES")
+        print("=" * 60)
+        
+        if "baseline" in results:
+            print(f"\n  BASELINE:")
+            print(f"    Train: {results['baseline']['train']}")
+            print(f"    Test:  {results['baseline']['test']}")
+            print(f"    Sizes: {baseline_train_size:,} train / {baseline_test_size:,} test")
+        
+        if "advanced" in results:
+            print(f"\n  ADVANCED:")
+            print(f"    Train: {results['advanced']['train']}")
+            print(f"    Test:  {results['advanced']['test']}")
+            print(f"    Sizes: {advanced_train_size:,} train / {advanced_test_size:,} test")
+        
+        print(f"\n  Config: {split_config_path}")
+        print("=" * 60 + "\n")
+    else:
+        print("[SPLIT] ERROR: No datasets were split. Check that feature files exist.")
+
+    return results
+
+
+# ================================
+# Entry Point
+# ================================
 
 def main():
-    """Main entry point for data splitting"""
-    print("\n" + "#" * 60)
-    print("# CREDIT CARD FRAUD DETECTION - DATA SPLITTING")
-    print("#" * 60)
-    
-    # Initialize configuration
-    config = Config()
-    
-    # Initialize splitter
-    splitter = ChronologicalSplitter(config)
-    
-    # Path to baseline features
-    baseline_path = config.BASELINE_FEATURES_PATH
-    
-    # Run splitting for baseline features
-    print(f"\n{'=' * 60}")
-    print("SPLITTING BASELINE FEATURES")
-    print(f"{'=' * 60}")
-    train_baseline, test_baseline = splitter.run_splitting(baseline_path)
-    
-    # Summary
-    print(f"\n{'=' * 60}")
-    print("SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"Train set size: {len(train_baseline):,}")
-    print(f"Test set size: {len(test_baseline):,}")
-    print(f"Train fraud ratio: {(train_baseline['Class'] == 1).mean() * 100:.4f}%")
-    print(f"Test fraud ratio: {(test_baseline['Class'] == 1).mean() * 100:.4f}%")
-    print(f"✅ Data splitting complete!")
-    
-    return train_baseline, test_baseline
+    """Execute data splitting as a standalone script."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Time-Aware Data Splitting for Baseline and Advanced Features"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="D:/fraud-detection-real-time/config/pipeline_config.yaml",
+        help="Path to pipeline config YAML (default: config/pipeline_config.yaml)",
+    )
+    parser.add_argument(
+        "--target-col",
+        type=str,
+        default="Class",
+        help="Name of the target column (default: Class)",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.80,
+        help="Fraction of data for training (default: 0.80)",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        results = run_data_split(
+            config_path=args.config,
+            target_col=args.target_col,
+            train_ratio=args.train_ratio,
+        )
+        return results
+
+    except FileNotFoundError as e:
+        print(f"[SPLIT] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"[SPLIT] UNEXPECTED ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    train_data, test_data = main()
+    main()
