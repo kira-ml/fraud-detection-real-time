@@ -25,12 +25,20 @@ env/
 # ================================
 # Data Files
 # ================================
-data/raw/*
-data/processed/*
-data/monitoring/*
+data/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/monitoring/.gitkeep
+!data/external/.gitkeep
+
+# ================================
+# Data Logging (EDA, Validation, Visualizations)
+# ================================
+data/data_logging/*
+!data/data_logging/.gitkeep
+
+
+
 
 # ================================
 # Model Artifacts (Binary)
