@@ -85,6 +85,7 @@ Two feature sets created for experimentation:
 │   │   ├── train_advanced.parquet
 │   │   ├── test_baseline.parquet
 │   │   └── test_advanced.parquet
+│   ├── monitoring/           # Labeled transactions for drift detection
 │   └── data_logging/         # EDA reports & visualizations
 ├── notebooks/                # Exploratory analysis & prototyping
 ├── src/
@@ -94,11 +95,13 @@ Two feature sets created for experimentation:
 │   │   └── train_ssl.py          # Autoencoder SSL
 │   ├── evaluation/           # Metrics calculation & visualization
 │   │   └── evaluate.py
-│   └── serve.py              # Flask REST API with auto model selection
+│   ├── serve.py              # Flask REST API with auto model selection
+│   └── monitor.py            # Offline drift detection & model health checks
 ├── models/                   # Trained model artifacts (.pkl) + evaluation JSONs
 ├── artifacts/
 │   ├── metrics/              # Training CV metrics
 │   └── evaluation/           # Test set evaluation reports
+├── reports/                  # Monitoring reports (timestamped JSON)
 ├── config/                   # Pipeline configuration YAML
 ├── logs/                     # API request logs
 ├── requirements.txt
@@ -209,6 +212,85 @@ curl -X POST http://localhost:5000/predict \
 
 ---
 
+## Monitoring & Maintenance (`src/monitor.py`)
+
+Offline monitoring pipeline that detects model performance degradation over time. Designed to run on a schedule against new labeled transaction batches (e.g., chargeback data).
+
+### Drift Detection Rules
+
+| Metric | Threshold | Action |
+|--------|-----------|--------|
+| **False Positive Rate** | >20% relative increase vs baseline | 🟡 Warning flagged |
+| **PR-AUC** | >10% relative drop vs baseline | 🟡 Warning flagged |
+| **Both healthy** | Within thresholds | ✅ No action required |
+
+### Usage
+
+```bash
+python -c "
+from pathlib import Path
+from src.monitor import MonitoringConfig, run_monitoring
+
+config = MonitoringConfig(
+    new_data_path=Path('data/monitoring/new_transactions_labeled.csv'),
+    model_path=Path('models/lightgbm_advanced.pkl'),
+    baseline_report_path=Path('models/lightgbm_advanced_evaluation.json'),
+    output_dir=Path('reports'),
+)
+
+result = run_monitoring(config)
+print(f'Report: {result[\"report_path\"]}')
+print(f'Action required: {result[\"action_required\"]}')
+"
+```
+
+### Monitoring Report Format
+
+```json
+{
+  "report_timestamp": "2026-05-07T00:08:36",
+  "model_name": "lightgbm_advanced",
+  "baseline": {
+    "pr_auc": 0.8121,
+    "false_positive_rate": 0.0002,
+    "recall": 0.7838,
+    "precision": 0.8529
+  },
+  "current": {
+    "pr_auc": 0.8124,
+    "false_positive_rate": 0.00018,
+    "recall": 0.7838,
+    "precision": 0.8529,
+    "confusion_matrix": {
+      "true_negatives": 56662,
+      "false_positives": 10,
+      "false_negatives": 16,
+      "true_positives": 58
+    }
+  },
+  "drift_flags": {
+    "fpr_warning": false,
+    "pr_auc_warning": false,
+    "any_warning": false,
+    "fpr_relative_change": -0.1177,
+    "pr_auc_relative_change": -0.0003
+  },
+  "action_required": false
+}
+```
+
+### Production Integration Path
+
+| Current | Production Upgrade |
+|---------|-------------------|
+| CSV file input | Data warehouse (ClickHouse/BigQuery) |
+| Local reports | Cloud object storage (S3/GCS) |
+| Console logging | Slack/PagerDuty alerts + Grafana dashboard |
+| Manual execution | Scheduled Airflow/Prefect DAG |
+| Static thresholds | Adaptive thresholds based on historical variance |
+
+---
+
 ## Model Approaches
 
 ### Baseline Models
@@ -286,6 +368,9 @@ python src/evaluation/evaluate.py --model models/lightgbm_advanced.pkl --test-ad
 
 # Start inference API
 python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
+
+# Run model monitoring
+python -c "from pathlib import Path; from src.monitor import MonitoringConfig, run_monitoring; config = MonitoringConfig(new_data_path=Path('data/monitoring/new_transactions_labeled.csv'), model_path=Path('models/lightgbm_advanced.pkl'), baseline_report_path=Path('models/lightgbm_advanced_evaluation.json'), output_dir=Path('reports')); result = run_monitoring(config); print(f'Action required: {result[\"action_required\"]}')"
 ```
 
 ---
@@ -312,6 +397,7 @@ python -c "from src.serve import get_app; app = get_app(); app.run(host='localho
 | Deployment Format | ONNX or pickle | ✅ joblib/pickle |
 | Class Imbalance Handling | SMOTE + cost-sensitive learning | ✅ Implemented |
 | Auto Model Selection | Best model by PR-AUC | ✅ ModelRegistry |
+| Drift Monitoring | FPR + PR-AUC vs baseline | ✅ Offline monitor |
 
 ---
 
@@ -330,4 +416,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-*Last updated: 06/05/2026 — Baseline pipeline complete, 11 models trained, LightGBM deployed via Flask API*
+*Last updated: 07/05/2026 — Baseline pipeline complete, 11 models trained, LightGBM deployed via Flask API, offline monitoring validated*
