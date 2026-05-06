@@ -1,0 +1,23 @@
+{
+  "pr_auc": 0.3585,
+  "roc_auc": 0.9686,
+  "average_precision": 0.0663,
+  "precision": 0.0511,
+  "recall": 0.7973,
+  "f1_score": 0.096,
+  "specificity": 0.9807,
+  "false_positive_rate": 0.0193,
+  "false_negative_rate": 0.2027,
+  "confusion_matrix": {
+    "true_negatives": 55576,
+    "false_positives": 1096,
+    "false_negatives": 15,
+    "true_positives": 59
+  },
+  "test_samples": 56746,
+  "fraud_caught": 59,
+  "fraud_missed": 15,
+  "legitimate_declined": 1096,
+  "inference_time_seconds": 0.1461,
+  "inference_time_ms_per_sample": 0.0
+}

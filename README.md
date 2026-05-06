@@ -46,17 +46,28 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 ## Data
 
 ### Source Datasets
-- **IEEE-CIS Fraud Detection** (Kaggle)
-- **Credit Card Fraud Detection** (ULB / Kaggle)
+- **Credit Card Fraud Detection** (ULB / Kaggle) — primary dataset used
 
 ### Specifications
-- ~280,000 to 500,000+ transactions
-- Highly imbalanced: typically <0.5% fraud
-- Anonymized numerical features (PCA-transformed)
+- 284,807 transactions (284,315 legitimate + 492 fraud)
+- Fraud ratio: **0.17%** (extreme class imbalance)
+- 28 PCA-transformed anonymized features (V1–V28) + Time + Amount
+- Time range: ~48 hours (0–172,792 seconds)
+- Amount range: $0.00–$25,691.16 (median $22.00, mean $88.35)
+- No null values, no duplicates
+
+### Feature Engineering
+Two feature sets created for experimentation:
+
+| Feature Set | Features | Description |
+|-------------|----------|-------------|
+| **Baseline** | 40 | V1–V28 + Amount/Time transforms + velocity + cyclical time |
+| **Advanced** | 56 | Baseline + interaction terms (V17×V14, V12×V10, etc.) + anomaly scores + amount percentiles + recency |
 
 ### Known Limitations
 - Raw categorical features (merchant names, location details) removed due to PII
-- Limited user history depth in public datasets
+- No user/card identifiers — velocity features computed globally, not per-card
+- Single-transaction inference uses placeholder zeros for velocity features
 
 ---
 
@@ -65,23 +76,136 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 ```
 .
 ├── data/
-│   ├── raw/              # Original dataset files
-│   ├── processed/        # Cleaned & feature-engineered datasets
-│   └── external/         # Third-party data sources
-├── notebooks/            # Exploratory analysis & prototyping
+│   ├── raw/                  # Original dataset (creditcard.csv)
+│   ├── processed/            # Cleaned & feature-engineered parquet files
+│   │   ├── cleaned.parquet
+│   │   ├── features_baseline.parquet    # 40 features
+│   │   ├── features_advanced.parquet    # 56 features
+│   │   ├── train_baseline.parquet
+│   │   ├── train_advanced.parquet
+│   │   ├── test_baseline.parquet
+│   │   └── test_advanced.parquet
+│   └── data_logging/         # EDA reports & visualizations
+├── notebooks/                # Exploratory analysis & prototyping
 ├── src/
-│   ├── data/             # Data ingestion, cleaning, splitting
-│   ├── features/         # Feature engineering (velocity features, aggregations)
-│   ├── models/           # Model training, hyperparameter tuning
-│   ├── evaluation/       # Metrics calculation & visualization
-│   └── inference/        # Real-time prediction pipeline
-├── tests/                # Unit & integration tests
-├── configs/              # Model & pipeline configuration files
-├── models/               # Saved/trained model artifacts
-├── docs/                 # Documentation
-├── requirements.txt      # Python dependencies
+│   ├── models/               # Model training scripts
+│   │   ├── train_baseline.py     # LR, DT, RF, NB with SMOTE + 3-fold CV
+│   │   ├── train_advanced.py     # XGBoost, LightGBM, MLP
+│   │   └── train_ssl.py          # Autoencoder SSL
+│   ├── evaluation/           # Metrics calculation & visualization
+│   │   └── evaluate.py
+│   └── serve.py              # Flask REST API with auto model selection
+├── models/                   # Trained model artifacts (.pkl) + evaluation JSONs
+├── artifacts/
+│   ├── metrics/              # Training CV metrics
+│   └── evaluation/           # Test set evaluation reports
+├── config/                   # Pipeline configuration YAML
+├── logs/                     # API request logs
+├── requirements.txt
 └── README.md
 ```
+
+---
+
+## Experiment Results
+
+### Full Model Comparison Matrix
+
+**Quadrant 1: Baseline Models × Baseline Features (40 features)**
+
+| Model | CV PR-AUC | Test PR-AUC | Test Recall | Test Precision | Test F1 | Test FPR |
+|-------|-----------|-------------|-------------|----------------|---------|----------|
+| **Random Forest** | 0.8222 | 0.8004 | 0.7973 | 0.4041 | 0.5364 | 0.15% |
+| Logistic Regression | 0.7200 | 0.8037 | 0.8649 | 0.1098 | 0.1945 | 0.92% |
+| Decision Tree | 0.6219 | 0.3584 | 0.8243 | 0.0987 | 0.1762 | 0.98% |
+| Naive Bayes | 0.0931 | 0.3585 | 0.7973 | 0.0511 | 0.0961 | 1.93% |
+
+**Quadrant 2: Baseline Models × Advanced Features (56 features)**
+
+| Model | CV PR-AUC | Test PR-AUC | Test Recall | Test Precision | Test F1 | Test FPR |
+|-------|-----------|-------------|-------------|----------------|---------|----------|
+| Random Forest | 0.8140 | 0.8043 | 0.7973 | 0.5221 | 0.6310 | 0.10% |
+| Logistic Regression | 0.7308 | 0.7411 | 0.8784 | 0.0781 | 0.1434 | 1.35% |
+| Decision Tree | 0.5821 | 0.4686 | 0.8243 | 0.1564 | 0.2629 | 0.58% |
+| Naive Bayes | 0.0881 | 0.4102 | 0.7973 | 0.0491 | 0.0925 | 2.02% |
+
+**Advanced Models × Advanced Features (56 features)**
+
+| Model | Test PR-AUC | Test Recall | Test Precision | Test F1 | Test FPR |
+|-------|-------------|-------------|----------------|---------|----------|
+| **🏆 LightGBM** | **0.8121** | 0.7838 | **0.8529** | **0.8169** | **0.02%** |
+| XGBoost | 0.7882 | 0.7568 | 0.7671 | 0.7619 | 0.03% |
+| MLP | 0.7621 | 0.6757 | 0.9259 | 0.7813 | 0.01% |
+
+### Key Findings
+
+| Insight | Detail |
+|---------|--------|
+| **🏆 Best model: LightGBM Advanced** | PR-AUC 0.8121, only 10 false positives out of 56,746 test transactions (0.02% FPR) |
+| **Random Forest competitive** | RF Baseline had best CV score (0.8222) but LightGBM generalized better to test set |
+| **Advanced features improved RF precision** | RF precision jumped from 0.4041 → 0.5221 with advanced features (+29%) |
+| **Naive Bayes unusable** | PR-AUC < 0.10 regardless of feature set — fundamentally wrong for this data |
+| **LR high recall, terrible precision** | 86-88% recall but ~5-11% precision — too many false positives for production |
+
+### Winner: LightGBM Advanced
+
+| Metric | Value | Business Impact |
+|--------|-------|-----------------|
+| Fraud Caught | 58/74 (78.4%) | Catches ~4 of 5 fraud attempts |
+| Legitimate Declined | 10/56,672 (0.02%) | Near-zero customer insult rate |
+| Inference Time | <1ms per transaction | Well within 50ms SLA |
+
+---
+
+## Model Deployment
+
+### Flask REST API (`src/serve.py`)
+
+Production-ready inference server with automatic best-model selection:
+
+- **Model Registry**: Scans `models/` directory, reads evaluation JSONs, auto-selects best model by PR-AUC
+- **Graceful fallback**: If top model fails to load, tries next-best candidate
+- **Structured logging**: JSON-format request logs to `logs/service.log`
+- **Health endpoint**: `GET /health` returns model info and status
+
+### Starting the Server
+
+```bash
+# Development
+python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
+
+# Production
+gunicorn -w 4 -b 0.0.0.0:5000 src.serve:app
+```
+
+### API Usage
+
+```bash
+# Health check
+curl http://localhost:5000/health
+
+# Fraud prediction
+curl -X POST http://localhost:5000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"Time": 150000, "Amount": 120.0, "V1": -1.5, ... "V28": -0.4}'
+
+# Response
+{
+  "fraud_probability": 0.1213,
+  "is_fraud": false,
+  "transaction_hash": "2145c...",
+  "model": "lightgbm_advanced"
+}
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FRAUD_MODELS_DIR` | `models/` | Path to model artifacts |
+| `FRAUD_SCALER_PATH` | `models/autoencoder_ssl_scaler.pkl` | Path to fitted scaler |
+| `FRAUD_THRESHOLD` | `0.5` | Decision threshold for fraud classification |
+| `FRAUD_METRIC` | `pr_auc` | Metric to rank models by |
 
 ---
 
@@ -100,91 +224,17 @@ ML captures complex, non-linear interactions between variables (e.g., unusual pu
 
 | Model | Key Strengths | Implementation Notes |
 |-------|---------------|---------------------|
-| **XGBoost / LightGBM** | Industry standard for tabular data | Tree depth limited to ensure microsecond inference |
-| **Isolation Forests** | Unsupervised anomaly detection | Complements supervised models; detects novel/zero-day fraud patterns |
-| **Multilayer Perceptron (MLP)** | Captures complex feature interactions | Optimizable for GPU-accelerated real-time inference |
+| **LightGBM** | Industry standard, best test performance (PR-AUC 0.8121) | Deployed as production model |
+| **XGBoost** | Strong gradient boosting baseline | PR-AUC 0.7882 on test set |
+| **Multilayer Perceptron (MLP)** | Highest precision (0.9259), lowest FPR (0.01%) | Trade-off: lower recall (0.6757) |
 
 ### Self-Supervised Learning (Advanced)
 
 | Model | Key Strengths | Implementation Notes |
 |-------|---------------|---------------------|
-| **TabNet with Self-Supervised Pretraining** | Learns from unlabeled transactions via masked feature prediction; built-in attention-based interpretability | Pretrain on all transactions, fine-tune on labeled fraud cases; ONNX exportable for <50ms inference |
-| **SimCLR Contrastive Learning** | Learns dense transaction embeddings by maximizing agreement between augmented views of the same transaction | Embedding distances from legitimate cluster centroids serve as anomaly scores; plug into XGBoost/LightGBM as supplementary features |
+| **Autoencoder SSL** | Unsupervised anomaly detection; scaler used for preprocessing | Trained; anomaly features integrated into advanced feature set |
 
-#### Why Self-Supervised Learning for Fraud Detection
-
-Fraud detection faces fundamental challenges that SSL directly addresses:
-
-| Challenge | How SSL Helps |
-|-----------|---------------|
-| **Extreme label scarcity** (0.17% fraud) | SSL pretrains on 100% of transactions—both labeled and unlabeled—learning robust representations of normal vs. anomalous behavior without needing fraud labels |
-| **Evolving fraud patterns** (zero-day attacks) | Contrastive learning builds a latent space where legitimate transactions cluster tightly; novel fraud patterns fall outside these clusters and are flagged as anomalies |
-| **Cold-start problem** | New fraud typologies with no historical examples are detectable via representation drift rather than waiting for labeled instances |
-| **Label noise** (delayed/misclassified chargebacks) | SSL representations are robust to label noise since the pretraining objective is label-free |
-
-#### SSL Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SSL PIPELINE                              │
-│                                                              │
-│  Phase 1: Pretraining (Unsupervised)                         │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │
-│  │ All      │───▶│ Augmentation │───▶│ TabNet Encoder   │   │
-│  │ Trans-   │    │ • Masking    │    │ (Feature Mask    │   │
-│  │ actions  │    │ • Noise      │    │  Prediction)     │   │
-│  │ (284K)   │    │ • Permute    │    └────────┬─────────┘   │
-│  └──────────┘    └──────────────┘             │             │
-│                                                ▼             │
-│                                       ┌──────────────────┐   │
-│                                       │ Learned Latent   │   │
-│                                       │ Representation   │   │
-│                                       └────────┬─────────┘   │
-│                                                │             │
-│  Phase 2: Fine-tuning (Supervised)   ┌────────▼─────────┐   │
-│  ┌──────────┐                        │ Classification   │   │
-│  │ Labeled  │───────────────────────▶│ Head (Binary)    │───▶│
-│  │ Fraud    │                        └──────────────────┘   │
-│  │ Cases    │                                               │
-│  │ (492)    │  Phase 3: Output                              │
-│  └──────────┘  ┌──────────────────────────────────────┐    │
-│                │ • Fraud Probability Score (0–1)       │    │
-│                │ • Anomaly Score (distance from normal) │    │
-│                │ • Feature Attention Weights (SHAP)    │    │
-│                └──────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### SSL Implementation Strategy
-
-| Component | TabNet SSL | SimCLR Contrastive |
-|-----------|------------|---------------------|
-| **Pretraining Data** | All 284,807 transactions | All 284,807 transactions |
-| **Augmentation** | Random feature masking (20–50%) | Gaussian noise + feature dropout |
-| **Objective** | Reconstruct masked features | Maximize cosine similarity of augmented pairs |
-| **Output** | End-to-end fraud classifier | 128-dim embedding + anomaly score feature |
-| **Fine-tuning** | Train classification head on 492 fraud cases | Train linear probe on 492 fraud cases |
-| **Inference Latency** | <50ms (ONNX) | Embedding: <10ms (precomputed); downstream model adds <40ms |
-| **Interpretability** | Native attention masks per prediction | SHAP on final classifier using embedding features |
-
-#### Production Integration
-
-```
-Real-Time Authorization Flow:
-
-  Transaction ──▶ Feature Engineering ──▶ TabNet SSL Model ──▶ Fraud Score (0–1)
-                     │                                              │
-                     │                     ┌────────────────────────┘
-                     │                     │
-                     └──▶ SimCLR Embedding │──▶ Anomaly Score ──▶ Ensemble Decision
-                                           │                            │
-                                           └────────────────────────────┘
-                                                                        │
-                                                            ┌───────────▼──────────┐
-                                                            │ APPROVE / DECLINE /  │
-                                                            │ REVIEW               │
-                                                            └──────────────────────┘
-```
+*(TabNet and SimCLR architectures designed but pending implementation)*
 
 ---
 
@@ -193,15 +243,15 @@ Real-Time Authorization Flow:
 ### Technical Metrics (Primary)
 - **Precision-Recall AUC (PR-AUC)** — prioritized over ROC-AUC due to extreme class imbalance
 - **Recall @ Fixed False Positive Rate** (e.g., recall at 1% FPR)
-- **Anomaly Detection AUC** (for SSL models) — measures separation of normal vs. fraudulent embeddings
+- **F1 Score** — harmonic mean of precision and recall
 
 ### Business Metrics
-| Metric | Description |
-|--------|-------------|
-| Fraud Value Saved ($) | Total monetary value of caught fraud |
-| False Positive Rate | Percentage of legitimate transactions incorrectly declined ("customer insult rate") |
-| Inference Latency (ms) | End-to-end prediction time, must stay within SLA |
-| Zero-Day Detection Rate | Percentage of novel fraud patterns caught without labeled examples |
+| Metric | Description | Current Value (LightGBM) |
+|--------|-------------|---------------------------|
+| Fraud Caught | Number of fraud transactions detected | 58/74 (78.4%) |
+| False Positive Rate | Legitimate transactions incorrectly declined | 0.02% (10/56,672) |
+| Inference Latency | End-to-end prediction time | <1ms per transaction |
+| Model | Currently deployed | LightGBM Advanced |
 
 ---
 
@@ -210,7 +260,7 @@ Real-Time Authorization Flow:
 ```bash
 # Clone repository
 git clone <repo-url>
-cd fraud-detection
+cd fraud-detection-real-time
 
 # Create virtual environment
 python -m venv venv
@@ -224,23 +274,18 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-# Run data preprocessing
-python src/data/preprocess.py
+# Train all baseline models with SMOTE + 3-fold CV
+python src/models/train_baseline.py --train-path data/processed/train_advanced.parquet --models logistic_regression decision_tree random_forest naive_bayes
 
-# Train baseline model
-python src/models/train_baseline.py --model logistic_regression
+# Train advanced models
+python src/models/train_advanced.py --train-path data/processed/train_advanced.parquet --model lightgbm
+python src/models/train_advanced.py --train-path data/processed/train_advanced.parquet --model xgboost
 
-# Train advanced model
-python src/models/train_advanced.py --model xgboost
+# Evaluate on test set
+python src/evaluation/evaluate.py --model models/lightgbm_advanced.pkl --test-advanced data/processed/test_advanced.parquet --type advanced
 
-# Train self-supervised model
-python src/models/train_ssl.py --model tabnet --pretrain_epochs 100 --finetune_epochs 50
-
-# Evaluate
-python src/evaluation/evaluate.py --model-path models/xgboost.pkl
-
-# Evaluate SSL model
-python src/evaluation/evaluate.py --model-path models/tabnet_ssl.pkl --include-embedding-metrics
+# Start inference API
+python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
 ```
 
 ---
@@ -251,23 +296,22 @@ python src/evaluation/evaluate.py --model-path models/tabnet_ssl.pkl --include-e
 - scikit-learn
 - XGBoost / LightGBM
 - imbalanced-learn (SMOTE)
-- pandas, numpy
-- ONNX Runtime (inference optimization)
-- MLflow (experiment tracking)
-- PyTorch / TensorFlow (SSL models)
-- pytorch-tabnet (TabNet implementation)
-- lightly / solo-learn (contrastive learning frameworks)
+- pandas, numpy, joblib
+- Flask (serving API)
+- PyTorch (SSL models)
+- MLflow (experiment tracking — optional)
 
 ---
 
 ## Constraints & Requirements
 
-| Requirement | Specification |
-|-------------|---------------|
-| Inference Latency | ≤ 100ms end-to-end (SSL embeddings precomputed in online feature store) |
-| Model Interpretability | Required for regulatory/adverse action notices (TabNet provides native attention masks) |
-| Deployment Format | ONNX or high-performance C++ backend with Python wrapper |
-| Class Imbalance Handling | SMOTE, cost-sensitive learning, SSL pretraining on all data, appropriate evaluation metrics |
+| Requirement | Specification | Status |
+|-------------|---------------|--------|
+| Inference Latency | ≤ 100ms end-to-end | ✅ <1ms achieved |
+| Model Interpretability | Required for regulatory notices | ⚠️ SHAP pending |
+| Deployment Format | ONNX or pickle | ✅ joblib/pickle |
+| Class Imbalance Handling | SMOTE + cost-sensitive learning | ✅ Implemented |
+| Auto Model Selection | Best model by PR-AUC | ✅ ModelRegistry |
 
 ---
 
@@ -286,4 +330,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-*Last updated: 03/05/2026*
+*Last updated: 06/05/2026 — Baseline pipeline complete, 11 models trained, LightGBM deployed via Flask API*

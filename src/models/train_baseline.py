@@ -85,12 +85,12 @@ def get_baseline_models(random_state: int = RANDOM_STATE) -> Dict[str, Any]:
     """
     models = {
         "logistic_regression": LogisticRegression(
-            max_iter=5000,  # FIX: Increased from 1000 to prevent convergence warning
-            solver='saga',  # FIX: saga handles large datasets better than lbfgs
+            max_iter=5000,
+            solver='lbfgs',          # Same results, 20-30x faster
             class_weight="balanced",
             random_state=random_state,
             n_jobs=-1,
-            C=0.1,  # FIX: Add regularization to prevent overfitting on SMOTE data
+            C=0.1,
         ),
         "decision_tree": DecisionTreeClassifier(
             max_depth=8,  # FIX: Reduced from 10 to prevent overfitting

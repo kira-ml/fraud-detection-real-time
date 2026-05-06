@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 from flask import Flask, jsonify, request
 
@@ -43,42 +44,44 @@ class FeatureAssemblyConfig:
 
     MUST match the training feature order exactly. Any discrepancy
     between this config and the training pipeline causes silent
-    prediction corruption (model receives features in wrong positions).
+    prediction corruption.
 
-    Attributes:
-        pca_features_ordered: Top-k PCA features in training order.
-        velocity_windows_seconds: Rolling window sizes used for velocity features.
-            Each window produces 3 features: count, avg_amount, std_amount.
-        include_amount_scaled: Whether to include StandardScaler-transformed Amount_log.
-        include_amount_log: Whether to include raw log-transformed Amount.
-        include_time_cyclical: Whether to include hour_sin and hour_cos.
+    Order matches train_advanced.parquet column order (56 features).
     """
 
-    pca_features_ordered: Tuple[str, ...] = (
-        "V17", "V14", "V12", "V10", "V16",
-        "V3", "V7", "V11", "V4", "V18",
+    # Full feature list in exact training order
+    feature_order: Tuple[str, ...] = (
+        # PCA features V1-V28 (indices 0-27)
+        "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10",
+        "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20",
+        "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28",
+        # Amount features (indices 28-29)
+        "Amount", "Amount_log",
+        # Time features (indices 30-33)
+        "hour", "day", "hour_sin", "hour_cos",
+        # Velocity features (indices 34-39)
+        "txn_count_1h", "avg_amount_1h", "std_amount_1h",
+        "txn_count_24h", "avg_amount_24h", "std_amount_24h",
+        # Interaction features (indices 40-43)
+        "V17_V14", "V12_V10", "V4_V11", "V3_V7",
+        # Amount ratios (indices 44-46)
+        "amount_ratio_1h", "amount_ratio_24h", "amount_zscore_1h",
+        # More velocity (indices 47-48)
+        "txn_count_10min", "avg_amount_10min",
+        # Recency (index 49)
+        "seconds_since_last_txn",
+        # Anomaly features (indices 50-51)
+        "anomaly_score", "anomaly_decision",
+        # Amount distribution (indices 52-55)
+        "amount_percentile", "amount_decile", "is_zero_amount", "is_night",
     )
-    velocity_windows_seconds: Tuple[int, ...] = (3600, 86400)
-    include_amount_scaled: bool = True
-    include_amount_log: bool = True
-    include_time_cyclical: bool = True
-
-    @property
-    def velocity_feature_count(self) -> int:
-        """Number of velocity features: windows × (count, avg, std)."""
-        return len(self.velocity_windows_seconds) * 3
 
     @property
     def total_feature_count(self) -> int:
         """Total number of features in the assembled vector."""
-        count = len(self.pca_features_ordered) + self.velocity_feature_count
-        if self.include_amount_scaled:
-            count += 1
-        if self.include_amount_log:
-            count += 1
-        if self.include_time_cyclical:
-            count += 2
-        return count
+        return len(self.feature_order)
+    
+
 
 
 @dataclass(frozen=True)
@@ -335,15 +338,6 @@ class ModelRegistry:
             if candidate.exists():
                 return candidate
 
-        # Try: lightgbm_advanced.json (if stem doesn't end with suffix already)
-        # Also try common naming patterns without the model name prefix
-        for suffix in self.EVAL_SUFFIXES:
-            # Handle case where JSON is just named like the model but without suffix pattern
-            for pattern in [f"{stem}.json"]:
-                candidate = model_path.parent / pattern
-                if candidate.exists() and candidate != model_path:
-                    return candidate
-
         return None
 
     def _parse_candidate(
@@ -394,7 +388,7 @@ class ModelRegistry:
         """Load a model with automatic format detection.
 
         Supports:
-            - Pickle: sklearn models, XGBoost sklearn wrapper, LightGBM sklearn wrapper
+            - joblib: sklearn models, XGBoost sklearn wrapper, LightGBM sklearn wrapper
             - PyTorch: .pth files (torch.load)
 
         Args:
@@ -406,22 +400,17 @@ class ModelRegistry:
         Raises:
             ValueError: If format is unsupported or file is corrupted.
         """
-        import pickle
-
         suffix = path.suffix.lower()
 
         if suffix == ".pkl":
             try:
-                with open(path, "rb") as f:
-                    return pickle.load(f)
-            except (pickle.UnpicklingError, EOFError, ModuleNotFoundError) as exc:
+                return joblib.load(path)
+            except Exception as exc:
                 raise ValueError(
-                    f"Failed to unpickle model from {path}: {exc}"
+                    f"Failed to load model from {path}: {exc}"
                 ) from exc
 
         elif suffix == ".pth":
-            # PRODUCTION NOTE: Add torch load with weights_only=True for security
-            # Currently torch.load(..., weights_only=False) has security risks
             try:
                 import torch
                 return torch.load(path, map_location="cpu", weights_only=True)
@@ -457,15 +446,12 @@ def load_scaler(path: Path) -> Any:
         FileNotFoundError: If path does not exist.
         ValueError: If deserialization fails.
     """
-    import pickle
-
     if not path.exists():
         raise FileNotFoundError(f"Scaler not found at {path.resolve()}")
 
     try:
-        with open(path, "rb") as f:
-            scaler = pickle.load(f)
-    except (pickle.UnpicklingError, EOFError, ModuleNotFoundError) as exc:
+        scaler = joblib.load(path)
+    except Exception as exc:
         raise ValueError(
             f"Failed to deserialize scaler from {path}: {exc}"
         ) from exc
@@ -512,73 +498,67 @@ class TransactionPreprocessor:
     def transform(self, payload: Dict[str, Any]) -> np.ndarray:
         """Convert raw JSON payload into model-ready feature vector.
 
-        Processing order (must match training pipeline):
-            1. Validate and extract Amount, Time, V1–V28
-            2. Amount_log = log(Amount + 1)
-            3. Amount_scaled = scaler.transform(Amount_log)
-            4. Cyclical time: hour_sin, hour_cos
-            5. Velocity features: placeholder zeros
-            6. Top-k PCA features
-            7. Concatenate in FeatureAssemblyConfig order
-
-        Args:
-            payload: Raw JSON dict with keys Time, Amount, V1–V28.
-
-        Returns:
-            2D numpy array of shape (1, n_features) for model.predict_proba().
-
-        Raises:
-            ValueError: If required fields are missing or values are invalid.
+        Builds all 56 features matching the advanced training pipeline order.
+        Velocity/derived features use placeholder values for single-request inference.
         """
         self._validate_payload(payload)
 
-        features: List[float] = []
-
-        # --- Step 1: Amount features ---
         amount_raw = float(payload["Amount"])
-        amount_log = float(np.log1p(amount_raw))
+        time_raw = float(payload["Time"])
+        hour_of_day = (time_raw / 3600.0) % 24
 
-        if self._feature_config.include_amount_scaled:
-            # StandardScaler expects 2D input
-            amount_scaled = float(
-                self._scaler.transform([[amount_log]])[0, 0]
-            )
-            features.append(amount_scaled)
+        # Build feature dict
+        fv: Dict[str, float] = {}
 
-        if self._feature_config.include_amount_log:
-            features.append(amount_log)
+        # V1-V28 from payload
+        for i in range(1, 29):
+            fv[f"V{i}"] = float(payload[f"V{i}"])
 
-        # --- Step 2: Cyclical time features ---
-        if self._feature_config.include_time_cyclical:
-            time_raw = float(payload["Time"])
-            hour_of_day = (time_raw / 3600.0) % 24
-            hour_sin = float(np.sin(2 * np.pi * hour_of_day / 24.0))
-            hour_cos = float(np.cos(2 * np.pi * hour_of_day / 24.0))
-            features.extend([hour_sin, hour_cos])
+        # Amount
+        fv["Amount"] = amount_raw
+        fv["Amount_log"] = float(np.log1p(amount_raw))
 
-        # --- Step 3: Velocity features (placeholder) ---
-        # PRODUCTION: Replace with online feature store lookup
-        velocity_count = self._feature_config.velocity_feature_count
-        features.extend([0.0] * velocity_count)
+        # Time
+        fv["hour"] = float(hour_of_day)
+        fv["day"] = 0.0 if time_raw < 86400 else 1.0
+        fv["hour_sin"] = float(np.sin(2 * np.pi * hour_of_day / 24.0))
+        fv["hour_cos"] = float(np.cos(2 * np.pi * hour_of_day / 24.0))
 
-        # --- Step 4: Top-k PCA features in training order ---
-        for pca_col in self._feature_config.pca_features_ordered:
-            if pca_col not in payload:
-                raise ValueError(
-                    f"Missing PCA feature: '{pca_col}'. "
-                    f"All {len(self._feature_config.pca_features_ordered)} "
-                    f"PCA features from feature_config are required."
-                )
-            features.append(float(payload[pca_col]))
+        # Interactions
+        fv["V17_V14"] = fv["V17"] * fv["V14"]
+        fv["V12_V10"] = fv["V12"] * fv["V10"]
+        fv["V4_V11"] = fv["V4"] * fv["V11"]
+        fv["V3_V7"] = fv["V3"] * fv["V7"]
 
-        feature_array = np.array(features, dtype=np.float64).reshape(1, -1)
+        # Velocity placeholders
+        fv["txn_count_1h"] = 0.0
+        fv["avg_amount_1h"] = 0.0
+        fv["std_amount_1h"] = 0.0
+        fv["txn_count_24h"] = 0.0
+        fv["avg_amount_24h"] = 0.0
+        fv["std_amount_24h"] = 0.0
+        fv["amount_ratio_1h"] = 0.0
+        fv["amount_ratio_24h"] = 0.0
+        fv["amount_zscore_1h"] = 0.0
+        fv["txn_count_10min"] = 0.0
+        fv["avg_amount_10min"] = 0.0
+        fv["seconds_since_last_txn"] = 0.0
 
-        expected = self._feature_config.total_feature_count
-        if feature_array.shape[1] != expected:
-            raise RuntimeError(
-                f"Feature count mismatch: assembled {feature_array.shape[1]} "
-                f"features, expected {expected}. Check FeatureAssemblyConfig."
-            )
+        # Anomaly placeholders
+        fv["anomaly_score"] = 0.0
+        fv["anomaly_decision"] = 0.0
+
+        # Amount distribution
+        fv["amount_percentile"] = 50.0
+        fv["amount_decile"] = 5.0
+        fv["is_zero_amount"] = 1.0 if amount_raw == 0 else 0.0
+        fv["is_night"] = 1.0 if (hour_of_day < 6 or hour_of_day >= 22) else 0.0
+
+        # Assemble in exact training order
+        feature_array = np.array(
+            [fv[f] for f in self._feature_config.feature_order],
+            dtype=np.float64,
+        ).reshape(1, -1)
 
         return feature_array
 
@@ -604,8 +584,6 @@ class TransactionPreprocessor:
             )
         if amount < 0:
             raise ValueError(f"'Amount' must be >= 0, got {amount}")
-        # Note: max_input_amount is validated in the server layer for clearer
-        # error separation (business logic vs feature engineering).
 
         # Validate Time
         time_val = payload["Time"]
@@ -647,7 +625,6 @@ class RequestLogger:
         if enabled:
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Dedicated file handler to avoid mixing with app logs
             self._file_handler = logging.FileHandler(str(log_path))
             self._file_handler.setFormatter(
                 logging.Formatter(
