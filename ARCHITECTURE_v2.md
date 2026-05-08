@@ -25,6 +25,8 @@
 
 This document defines the complete architecture for an end-to-end machine learning pipeline that detects fraudulent credit card transactions at the point of authorization. It covers both a **Baseline** implementation for local development on an Intel Core i5 laptop and an **Advanced** production implementation. The dataset used is the ULB Credit Card Fraud Detection dataset with 284,807 transactions, 31 columns (Time, V1–V28, Amount, Class), and an extreme class imbalance of 0.17% fraud.
 
+**🟢 UPDATE (2026-05-09):** PostgreSQL 18 database integration complete. All major pipeline components now read from or write to PostgreSQL. See Section 3 for database infrastructure details.
+
 ---
 
 ### 2. Pipeline Architecture (Textual Diagram)
@@ -36,7 +38,7 @@ This document defines the complete architecture for an end-to-end machine learni
         │
         ▼
  ┌──────────────────────┐
- │  1. DATA INGESTION   │  Pandas read_csv → df_raw
+ │  1. DATA INGESTION   │  Pandas read_csv → df_raw → PostgreSQL (284,808 rows)
  └──────────┬───────────┘
             │
             ▼
@@ -66,24 +68,109 @@ This document defines the complete architecture for an end-to-end machine learni
             │
             ▼
  ┌──────────────────────┐
- │  7. MODEL TRAINING   │  SMOTE + Logistic Regression, Decision Tree, Random Forest
+ │  7. MODEL TRAINING   │  SMOTE + Logistic Regression, Decision Tree, Random Forest, XGBoost, LightGBM, MLP
  └──────────┬───────────┘
             │
             ▼
  ┌──────────────────────┐
- │ 8. MODEL EVALUATION  │  PR-AUC primary metric, threshold at 80% recall
+ │ 8. MODEL EVALUATION  │  PR-AUC primary metric → saves to monitoring_metrics table
  └──────────┬───────────┘
             │
             ▼
  ┌──────────────────────┐
- │  9. MODEL DEPLOYMENT │  Flask API → localhost:5000/predict
+ │  9. MODEL DEPLOYMENT │  Flask API → localhost:5000/predict → logs to PostgreSQL
  └──────────┬───────────┘
             │
             ▼
  ┌──────────────────────────────┐
- │ 10. MONITORING & MAINTENANCE │  Offline drift checks, metric comparison
+ │ 10. MONITORING & MAINTENANCE │  DB-sourced drift detection, metrics to monitoring_metrics
  └──────────────────────────────┘
 ```
+
+---
+
+### 3. Database Infrastructure (PostgreSQL 18) 🆕
+
+#### Instance Details
+
+| Property | Value |
+|----------|-------|
+| Version | PostgreSQL 18 |
+| Location | D:\PostgreSQL\18\data |
+| Port | 5433 |
+| Database Name | fraud_detection |
+| Connection Module | src/database/connection.py |
+| Schema Definition | src/database/schema.sql |
+| Total Transactions | 284,808 (284,807 original + test predictions) |
+
+#### Tables
+
+| Table | Description | Integration Point |
+|-------|-------------|-------------------|
+| `transactions` | Raw transaction storage (284,808 rows) | ingest.py (bulk), serve.py (real-time) |
+| `predictions` | Model prediction logging | serve.py (every /predict call) |
+| `ground_truth` | Chargeback/feedback labels | record_feedback() function |
+| `model_registry` | Deployed model tracking | Seeded with lightgbm_advanced v1.0 |
+| `monitoring_metrics` | Evaluation + drift metrics | monitor.py, evaluate.py |
+
+#### Analytics Views
+
+| View | Purpose |
+|------|---------|
+| `vw_transaction_results` | Transactions JOIN predictions JOIN ground truth |
+| `vw_daily_performance` | Daily recall, precision, FPR, latency |
+| `vw_model_leaderboard` | Active models ranked by PR-AUC |
+| `vw_recent_alerts` | Last 7 days of drift warnings |
+
+#### Stored Functions
+
+| Function | Purpose |
+|----------|---------|
+| `record_feedback()` | Upsert ground truth labels |
+| `get_model_performance()` | Query metrics by date range |
+
+---
+
+### 4. Database Integration Status 🆕
+
+#### ✅ Completed
+
+| Component | File | What It Does |
+|-----------|------|--------------|
+| Database Setup | PostgreSQL 18 (D:\) | Installed, port 5433, fraud_detection DB |
+| Schema | src/database/schema.sql | 5 tables, 4 views, 2 functions |
+| Connection Module | src/database/connection.py | SQLAlchemy engine + session factory |
+| API → DB Logging | src/serve.py | Every /predict saved to transactions + predictions |
+| Bulk Ingestion | src/ingest.py | 284,807 CSV rows → PostgreSQL |
+| DB-Sourced Monitoring | src/monitor.py | Drift detection from vw_transaction_results |
+| Evaluation Logging | src/evaluation/evaluate.py | Test metrics → monitoring_metrics |
+| Model Registry | model_registry table | lightgbm_advanced v1.0 registered |
+| Ground Truth | record_feedback() | Upsert feedback with conflict handling |
+
+#### 🟡 Medium Priority — To Do
+
+| # | File | What to Change | Why |
+|---|------|---------------|-----|
+| 1 | `src/split.py` | Log split metadata to DB | Track train/test boundaries over time |
+| 2 | `src/models/train_baseline.py` | Auto-register model in model_registry | Traceability for every model trained |
+| 3 | `src/models/train_advanced.py` | Auto-register model in model_registry | Same as above |
+
+#### 🟢 Low Priority — To Do
+
+| # | File | What to Change | Why |
+|---|------|---------------|-----|
+| 4 | `src/preprocess.py` | Save preprocessing metadata to DB | Track scaler/config per model version |
+| 5 | `src/validate.py` | Log validation results to monitoring_metrics | Data quality audit trail |
+| 6 | `config/pipeline_config.yaml` | Add DB connection section | Centralize database settings |
+
+#### 🔮 Future — Graph-Based Models
+
+| Task | Purpose |
+|------|---------|
+| Add `card_id`, `merchant_id` to transactions | Entity resolution for graph edges |
+| Build bipartite graph (card ↔ merchant) | Detect fraud rings, botnets |
+| Train GNN / GraphSAGE | Coordinated fraud detection |
+| Extract graph features → feed into LightGBM | Hybrid modeling approach |
 
 ---
 
@@ -97,11 +184,14 @@ This document defines the complete architecture for an end-to-end machine learni
 
 **Description:** A minimal file-reader module that loads the raw ULB Credit Card Fraud Detection CSV file into a Pandas DataFrame. The dataset contains 284,807 transactions with 31 columns: `Time` (seconds elapsed), `V1`–`V28` (PCA-transformed features), `Amount` (transaction amount in local currency), and `Class` (0 = legitimate, 1 = fraud).
 
+**🟢 UPDATE:** Now supports bulk loading to PostgreSQL via the `load_to_database()` function. All 284,807 rows migrated successfully.
+
 **Responsibilities:**
 - Read the CSV file path from `config/pipeline_config.yaml`.
 - Perform a quick sanity check: confirm 284,807 rows and 31 columns loaded.
 - Report memory usage and column schema to console.
 - Return a DataFrame object for downstream steps.
+- **NEW:** Optionally bulk insert into PostgreSQL `transactions` table (batch size: 5,000).
 
 **Input:** A file path string (`data/raw/creditcard.csv`). The CSV contains no header issues; all 31 columns are numeric (float64 for V1–V28, Amount, Time; int64 for Class).
 
@@ -357,6 +447,8 @@ This document defines the complete architecture for an end-to-end machine learni
 
 **Description:** A script evaluating the trained model on the held-out 20% test set (~56,962 transactions). Prioritizes PR-AUC due to the 0.17% class imbalance and determines an optimal decision threshold.
 
+**🟢 UPDATE:** Now saves evaluation metrics directly to the `monitoring_metrics` PostgreSQL table via `save_metrics_to_database()`. Seven metrics are logged per evaluation: pr_auc, roc_auc, f1_score, recall, precision, fpr, fnr. Each entry includes metadata (test_samples, fraud_count, evaluation_type).
+
 **Responsibilities:**
 - Load `test.parquet` and `model.pkl`.
 - Generate fraud probability scores for all test transactions.
@@ -366,10 +458,11 @@ This document defines the complete architecture for an end-to-end machine learni
 - Find threshold achieving 1% false positive rate and report recall.
 - Generate confusion matrix at selected deployment threshold.
 - Save all metrics and the recommended threshold.
+- **NEW:** Persist metrics to `monitoring_metrics` table in PostgreSQL.
 
 **Input:** `data/processed/test.parquet` (~56,962 rows), `artifacts/model.pkl`.
 
-**Output:** `reports/evaluation_report.json` (PR-AUC, ROC-AUC, precision@80recall, FPR@80recall, threshold@80recall, threshold@1fpr). `reports/confusion_matrix.csv`.
+**Output:** `reports/evaluation_report.json` (PR-AUC, ROC-AUC, precision@80recall, FPR@80recall, threshold@80recall, threshold@1fpr). `reports/confusion_matrix.csv`. Database: `monitoring_metrics` table updated.
 
 ### Advanced Approach
 
@@ -396,16 +489,19 @@ This document defines the complete architecture for an end-to-end machine learni
 
 **Description:** A Flask REST API serving fraud predictions locally on `localhost:5000`. Loads the serialized model and scaler, applies identical preprocessing to incoming requests, and returns fraud probabilities.
 
+**🟢 UPDATE:** Now logs every prediction to PostgreSQL. Each `/predict` call inserts a row into `transactions` and `predictions` tables, enabling full audit trail and enabling DB-sourced monitoring. Database logging is non-blocking — API continues serving even if DB is temporarily unavailable.
+
 **Responsibilities:**
 - Load `model.pkl` and `scaler.pkl` into memory on startup.
 - Expose POST `/predict` endpoint accepting JSON transactions.
 - Apply preprocessing: scale `Amount` using loaded scaler, compute `Amount_log`, `hour_sin/cos`, velocity features from request context.
 - Return `{"fraud_probability": 0.92, "is_fraud": true/false}` using the threshold selected during evaluation.
 - Log every request to `logs/service.log` with timestamp, input hash, and prediction.
+- **NEW:** Log every request to PostgreSQL `transactions` + `predictions` tables.
 
 **Input:** POST `http://localhost:5000/predict` — JSON body: `{"Time": 150000, "V1": -1.5, ..., "V28": 0.3, "Amount": 120.0}`.
 
-**Output:** JSON response: `{"fraud_probability": 0.92, "is_fraud": true}`. Logs appended to `logs/service.log`.
+**Output:** JSON response: `{"fraud_probability": 0.92, "is_fraud": true, "transaction_id": "547066...", "model": "lightgbm_advanced"}`. Logs appended to `logs/service.log` and PostgreSQL.
 
 ### Advanced Approach
 
@@ -432,16 +528,20 @@ This document defines the complete architecture for an end-to-end machine learni
 
 **Description:** An offline monitoring script that periodically loads a new batch of labeled transactions and compares model performance against the evaluation baseline.
 
+**🟢 UPDATE:** Now supports DB-sourced monitoring via `use_database=True` flag. Instead of loading CSV files and running inference, it queries `vw_transaction_results` for transactions with ground truth labels. Drift metrics are saved to `monitoring_metrics` table. Falls back to CSV-based monitoring when `use_database=False`.
+
 **Responsibilities:**
 - Load `data/monitoring/new_transactions_labeled.csv` (simulated production feedback with ground truth).
+- **NEW:** OR query `vw_transaction_results` from PostgreSQL (when `use_database=True`).
 - Run model inference and compute PR-AUC, false positive rate, recall.
 - Compare against baseline metrics from `reports/evaluation_report.json`.
 - Flag warning if false positive rate increases >20% relative or PR-AUC drops >10%.
 - Save timestamped monitoring report.
+- **NEW:** Save drift check results to `monitoring_metrics` table.
 
-**Input:** `data/monitoring/new_transactions_labeled.csv`, `artifacts/model.pkl`, `reports/evaluation_report.json`.
+**Input:** `data/monitoring/new_transactions_labeled.csv` (CSV mode) OR PostgreSQL `vw_transaction_results` (DB mode), `artifacts/model.pkl`, `reports/evaluation_report.json`.
 
-**Output:** `reports/monitoring_report_YYYYMMDD.json` with current metrics, baseline metrics, drift flags.
+**Output:** `reports/monitoring_report_YYYYMMDD.json` with current metrics, baseline metrics, drift flags. Database: `monitoring_metrics` table updated.
 
 ### Advanced Approach
 
@@ -487,52 +587,64 @@ This document defines the complete architecture for an end-to-end machine learni
 fraud-detection-real-time/
 ├── config/
 │   ├── pipeline_config.yaml
-│   └── split_timestamp.txt
+│   └── split_config.txt
 ├── data/
 │   ├── raw/
 │   │   └── creditcard.csv              # 284,807 rows × 31 columns
 │   ├── processed/
 │   │   ├── cleaned.parquet
-│   │   ├── features.parquet
-│   │   ├── train.parquet
-│   │   └── test.parquet
-│   └── monitoring/
-│       └── new_transactions_labeled.csv
+│   │   ├── features_advanced.parquet
+│   │   ├── features_baseline.parquet
+│   │   ├── train_advanced.parquet
+│   │   ├── train_baseline.parquet
+│   │   ├── test_advanced.parquet
+│   │   └── test_baseline.parquet
+│   ├── monitoring/
+│   │   └── new_transactions_labeled.csv
+│   └── data_logging/
+│       ├── eda_results/
+│       └── validation_results/
 ├── artifacts/
-│   ├── scaler.pkl
-│   ├── feature_config.json
-│   ├── model.pkl
-│   └── model_metadata.json
+│   ├── evaluation/                     # Test metrics JSONs
+│   ├── metrics/                        # Training CV metrics
+│   ├── plots/                          # Comparison plots
+│   ├── feature_config_advanced.json
+│   ├── feature_config_baseline.json
+│   └── scaler.pkl
+├── models/                             # 11 trained models + evaluation JSONs
 ├── reports/
-│   ├── validation_report.json
 │   ├── eda/
-│   │   ├── class_distribution.png
-│   │   ├── amount_histogram.png
-│   │   ├── correlation_heatmap.png
-│   │   ├── fraud_by_hour.png
-│   │   └── feature_correlation_ranking.csv
-│   ├── evaluation_report.json
-│   ├── confusion_matrix.csv
-│   └── monitoring_report_YYYYMMDD.json
+│   ├── validation_report.json
+│   └── monitoring_report_*.json
 ├── logs/
 │   └── service.log
 ├── src/
-│   ├── ingest.py
+│   ├── database/                       # 🆕 PostgreSQL integration
+│   │   ├── connection.py               # SQLAlchemy engine + session
+│   │   ├── schema.sql                  # 5 tables, 4 views, 2 functions
+│   │   └── __init__.py
+│   ├── models/
+│   │   ├── train_baseline.py
+│   │   ├── train_advanced.py
+│   │   └── train_ssl.py
+│   ├── evaluation/
+│   │   ├── evaluate.py                 # 🆕 Logs to monitoring_metrics
+│   │   ├── visualize.py
+│   │   └── __init__.py
+│   ├── ingest.py                       # 🆕 Bulk load to PostgreSQL
 │   ├── validate.py
 │   ├── preprocess.py
 │   ├── eda.py
 │   ├── feature_engineering.py
 │   ├── split.py
-│   ├── train.py
-│   ├── evaluate.py
-│   ├── serve.py
-│   └── monitor.py
+│   ├── serve.py                        # 🆕 Logs predictions to DB
+│   ├── monitor.py                      # 🆕 DB-sourced drift detection
+│   └── data_validation_eda_pipeline.py
 ├── notebooks/
-│   └── eda_interactive.ipynb
-├── requirements.txt
-├── .gitignore
+├── DATABASE_GUIDE.md                   # 🆕 Daily workflow reference
 ├── ARCHITECTURE.md
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 ---
@@ -540,13 +652,28 @@ fraud-detection-real-time/
 ### 7. Execution Flow (Baseline)
 
 ```powershell
-python src/ingest.py          # Load CSV, confirm 284,807 rows
+# Data Pipeline
+python -m src.ingest          # Load CSV → PostgreSQL (284,807 rows)
 python src/validate.py        # Schema check, nulls, duplicates
 python src/preprocess.py      # Scale Amount & Time, save scaler
 python src/eda.py             # Generate plots and statistics
 python src/feature_engineering.py  # Velocity features, cyclical time
 python src/split.py           # 80/20 time-aware split
-python src/train.py           # SMOTE + Logistic Regression, Decision Tree, Random Forest
-python src/evaluate.py        # PR-AUC, threshold tuning
-python src/serve.py           # Start Flask API on localhost:5000
+
+# Model Training
+python src/models/train_baseline.py    # LR, DT, RF with SMOTE + 3-fold CV
+python src/models/train_advanced.py    # XGBoost, LightGBM, MLP
+
+# Evaluation
+python -m src.evaluation.evaluate --model models/lightgbm_advanced.pkl
+
+# Deployment
+python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
+
+# Monitoring (DB mode)
+python -c "from pathlib import Path; from src.monitor import MonitoringConfig, run_monitoring; config = MonitoringConfig(new_data_path=Path('data/monitoring/new_transactions_labeled.csv'), model_path=Path('models/lightgbm_advanced.pkl'), baseline_report_path=Path('models/lightgbm_advanced_evaluation.json'), output_dir=Path('reports'), use_database=True); result = run_monitoring(config); print(f'Action required: {result[\"action_required\"]}')"
 ```
+
+---
+
+*Last updated: 2026-05-09 — PostgreSQL 18 integration complete. 284,808 rows in database. serve.py, monitor.py, evaluate.py, and ingest.py all integrated with PostgreSQL. See Section 4 for remaining tasks.*

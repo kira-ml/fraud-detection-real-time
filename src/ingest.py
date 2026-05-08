@@ -7,6 +7,9 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from src.database.connection import get_db_session
+from sqlalchemy import text
+import numpy as np
 
 import pandas as pd
 import yaml
@@ -192,10 +195,63 @@ def ingest_data(config_path: Optional[str] = None) -> pd.DataFrame:
     return df_raw
 
 
+
+def load_to_database(df: pd.DataFrame, batch_size: int = 5000) -> int:
+    """Bulk insert DataFrame into PostgreSQL transactions table.
+    
+    Args:
+        df: DataFrame with columns Time, V1-V28, Amount, Class.
+        batch_size: Number of rows per INSERT batch.
+    
+    Returns:
+        Number of rows inserted.
+    """
+    total_rows = len(df)
+    rows_inserted = 0
+    
+    print(f"[INGEST] Loading {total_rows:,} rows to PostgreSQL...")
+    
+    for start in range(0, total_rows, batch_size):
+        batch = df.iloc[start:start + batch_size]
+        
+        with get_db_session() as session:
+            for _, row in batch.iterrows():
+                v_params = {f"v{i}": float(row.get(f"V{i}", 0.0)) for i in range(1, 29)}
+                
+                session.execute(
+                    text("""
+                        INSERT INTO transactions (
+                            time_seconds, amount,
+                            v1, v2, v3, v4, v5, v6, v7, v8, v9, v10,
+                            v11, v12, v13, v14, v15, v16, v17, v18, v19, v20,
+                            v21, v22, v23, v24, v25, v26, v27, v28
+                        ) VALUES (
+                            :time_val, :amount,
+                            :v1, :v2, :v3, :v4, :v5, :v6, :v7, :v8, :v9, :v10,
+                            :v11, :v12, :v13, :v14, :v15, :v16, :v17, :v18, :v19, :v20,
+                            :v21, :v22, :v23, :v24, :v25, :v26, :v27, :v28
+                        )
+                    """),
+                    {
+                        "time_val": float(row.get("Time", 0)),
+                        "amount": float(row.get("Amount", 0)),
+                        **v_params
+                    }
+                )
+        
+        rows_inserted += len(batch)
+        pct = (rows_inserted / total_rows) * 100
+        print(f"  Progress: {rows_inserted:,}/{total_rows:,} ({pct:.1f}%)")
+    
+    print(f"[INGEST] Loaded {rows_inserted:,} rows to PostgreSQL")
+    return rows_inserted
+
+
+
+
 # ================================
 # Entry Point
 # ================================
-
 def main():
     """
     Execute data ingestion as a standalone script.
@@ -203,6 +259,10 @@ def main():
     """
     try:
         df_raw = ingest_data()
+        # Optionally load to database
+        load_to_db = input("\nLoad data to PostgreSQL? (y/n): ").strip().lower()
+        if load_to_db == 'y':
+            load_to_database(df_raw)
         print(f"\n[INGEST] Successfully ingested {len(df_raw):,} transactions.")
         return df_raw
         

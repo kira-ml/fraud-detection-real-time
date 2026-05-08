@@ -28,6 +28,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from src.database.connection import get_db_session, engine
+from sqlalchemy import text
+import uuid
 
 import joblib
 import numpy as np
@@ -899,6 +902,15 @@ class FraudModelServer:
                 model_name=self._registry.model_name,
             )
 
+            # --- Database logging ---
+            self._log_to_database(
+                transaction_id=txn_hash,
+                payload=payload,
+                fraud_probability=fraud_probability,
+                is_fraud=is_fraud,
+                latency_ms=latency_ms,
+            )
+
             self._logger.debug(
                 "Prediction [txn=%s]: prob=%.4f fraud=%s lat=%.2fms model=%s",
                 txn_hash[:16],
@@ -914,12 +926,73 @@ class FraudModelServer:
                     {
                         "fraud_probability": round(fraud_probability, 6),
                         "is_fraud": is_fraud,
-                        "transaction_hash": txn_hash,
+                        "transaction_id": txn_hash,
                         "model": self._registry.model_name,
                     }
                 ),
                 200,
             )
+
+
+    def _log_to_database(
+        self,
+        transaction_id: str,
+        payload: Dict[str, Any],
+        fraud_probability: float,
+        is_fraud: bool,
+        latency_ms: float,
+    ) -> None:
+        """Log prediction to PostgreSQL database."""
+        try:
+            with get_db_session() as session:
+                # Insert transaction
+                session.execute(
+                    text("""
+                        INSERT INTO transactions (
+                            transaction_id, time_seconds, amount,
+                            v1, v2, v3, v4, v5, v6, v7, v8, v9, v10,
+                            v11, v12, v13, v14, v15, v16, v17, v18, v19, v20,
+                            v21, v22, v23, v24, v25, v26, v27, v28
+                        ) VALUES (
+                            :tid, :time, :amount,
+                            :v1, :v2, :v3, :v4, :v5, :v6, :v7, :v8, :v9, :v10,
+                            :v11, :v12, :v13, :v14, :v15, :v16, :v17, :v18, :v19, :v20,
+                            :v21, :v22, :v23, :v24, :v25, :v26, :v27, :v28
+                        )
+                    """),
+                    {
+                        "tid": transaction_id,
+                        "time": payload.get("Time", 0),
+                        "amount": payload.get("Amount", 0),
+                        **{f"v{i}": payload.get(f"V{i}", 0.0) for i in range(1, 29)}
+                    }
+                )
+                
+                # Insert prediction
+                session.execute(
+                    text("""
+                        INSERT INTO predictions (
+                            transaction_id, model_name,
+                            fraud_probability, is_fraud,
+                            inference_time_ms
+                        ) VALUES (
+                            :tid, :model_name,
+                            :prob, :is_fraud,
+                            :latency
+                        )
+                    """),
+                    {
+                        "tid": transaction_id,
+                        "model_name": self._registry.model_name,
+                        "prob": fraud_probability,
+                        "is_fraud": is_fraud,
+                        "latency": latency_ms,
+                    }
+                )
+                
+            self._logger.debug("Database logged: %s", transaction_id[:16])
+        except Exception as e:
+            self._logger.warning("Database logging failed (non-fatal): %s", e)
 
     def run(
         self,

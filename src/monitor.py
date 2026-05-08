@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from src.database.connection import get_db_session
+from sqlalchemy import text
 
 import numpy as np
 import pandas as pd
@@ -74,6 +76,7 @@ class MonitoringConfig:
     pr_auc_drop_threshold: float = 0.10
     target_column: str = "Class"
     probability_threshold: Optional[float] = None
+    use_database: bool = False  # NEW: Set True to query DB instead of CSV
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -283,6 +286,44 @@ def load_baseline_metrics(report_path: Path) -> BaselineMetrics:
 # ---------------------------------------------------------------------------
 
 
+def load_monitoring_data_from_db(
+    days_back: int = 7,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load labeled transactions from PostgreSQL database.
+    
+    Queries vw_transaction_results for transactions that have
+    ground truth labels within the specified time window.
+    
+    Args:
+        days_back: Number of days to look back for labeled data.
+    
+    Returns:
+        Tuple of (y_true, y_proba).
+    """
+    logger.info("Loading monitoring data from database (last %d days)...", days_back)
+    
+    with get_db_session() as session:
+        result = session.execute(
+            text("""
+                SELECT fraud_probability, actual_fraud
+                FROM vw_transaction_results
+                WHERE actual_fraud IS NOT NULL
+                  AND timestamp_received >= CURRENT_TIMESTAMP - :days * INTERVAL '1 day'
+                ORDER BY timestamp_received DESC
+            """),
+            {"days": days_back}
+        )
+        rows = result.fetchall()
+    
+    if not rows:
+        raise ValueError("No labeled transactions found in database")
+    
+    y_proba = np.array([row[0] for row in rows], dtype=np.float64)
+    y_true = np.array([row[1] for row in rows], dtype=np.int64)
+    
+    logger.info("Loaded %d labeled samples from DB", len(y_true))
+    return y_true, y_proba
+
 def load_monitoring_data(
     data_path: Path,
     target_column: str = "Class",
@@ -427,7 +468,15 @@ def compute_current_metrics(
     y_pred = (y_proba >= threshold).astype(np.int64)
 
     # Confusion matrix
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        # Handle case where only one class is present
+        tn = int((y_true == 0) & (y_pred == 0)).sum()
+        fp = int((y_true == 0) & (y_pred == 1)).sum()
+        fn = int((y_true == 1) & (y_pred == 0)).sum()
+        tp = int((y_true == 1) & (y_pred == 1)).sum()
 
     # Metrics
     pr_auc = 0.0
@@ -626,6 +675,43 @@ def generate_monitoring_report(
     return report_path
 
 
+
+def save_metrics_to_database(
+    model_name: str,
+    current: CurrentMetrics,
+    baseline: BaselineMetrics,
+    flags: DriftFlags,
+) -> bool:
+    """Save monitoring results to monitoring_metrics table."""
+    try:
+        with get_db_session() as session:
+            session.execute(
+                text("""
+                    INSERT INTO monitoring_metrics (
+                        model_name, metric_type, metric_value,
+                        baseline_value, deviation_percent,
+                        is_warning, is_critical, details
+                    ) VALUES 
+                    (:name, 'pr_auc', :pr_val, :pr_base, :pr_dev, :warn, false, '{}'),
+                    (:name, 'fpr', :fpr_val, :fpr_base, :fpr_dev, :warn, false, '{}')
+                """),
+                {
+                    "name": model_name,
+                    "pr_val": current.pr_auc,
+                    "pr_base": baseline.pr_auc,
+                    "pr_dev": flags.pr_auc_relative_change * 100,
+                    "fpr_val": current.false_positive_rate,
+                    "fpr_base": baseline.false_positive_rate,
+                    "fpr_dev": flags.fpr_relative_change * 100,
+                    "warn": flags.any_warning,
+                }
+            )
+        logger.info("Metrics saved to monitoring_metrics table")
+        return True
+    except Exception as e:
+        logger.warning("Failed to save metrics to DB: %s", e)
+        return False
+
 # ---------------------------------------------------------------------------
 # Main Monitoring Pipeline
 # ---------------------------------------------------------------------------
@@ -655,25 +741,30 @@ def run_monitoring(
         FileNotFoundError: If any required input file is missing.
         ValueError: If data validation fails or metrics cannot be computed.
     """
-    logger.info("=" * 60)
-    logger.info("MONITORING PIPELINE START")
-    logger.info("=" * 60)
+
+
+
 
     # Step 1: Load baseline metrics
     baseline = load_baseline_metrics(config.baseline_report_path)
 
-    # Step 2: Load new monitoring data
-    X_new, y_new, df_new = load_monitoring_data(
-        config.new_data_path,
-        target_column=config.target_column,
-    )
+    if config.use_database:
+        # Load from database (predictions already stored)
+        y_new, y_proba = load_monitoring_data_from_db()
+        logger.info("Using database-sourced monitoring data")
+    else:
+        # Original CSV-based loading
+        X_new, y_new, df_new = load_monitoring_data(
+            config.new_data_path,
+            target_column=config.target_column,
+        )
+        # Step 3: Load deployed model
+        model = load_model(config.model_path)
+        # Step 4: Run inference
+        logger.info("Running inference on %d samples...", len(X_new))
+        y_proba = model.predict_proba(X_new)[:, 1]
 
-    # Step 3: Load deployed model
-    model = load_model(config.model_path)
 
-    # Step 4: Run inference
-    logger.info("Running inference on %d samples...", len(X_new))
-    y_proba = model.predict_proba(X_new)[:, 1]
 
     # Step 5: Determine threshold
     threshold = (
@@ -722,6 +813,26 @@ def run_monitoring(
         flags.any_warning,
     )
     logger.info("=" * 60)
+
+    # Save to database
+    if config.use_database:
+        save_metrics_to_database(
+            model_name=config.model_path.stem,
+            current=current,
+            baseline=baseline,
+            flags=flags,
+        )
+
+
+
+    logger.info("=" * 60)
+    logger.info(
+        "MONITORING COMPLETE — Action Required: %s",
+        flags.any_warning,
+    )
+    logger.info("=" * 60)
+
+
 
     return {
         "report_path": report_path,

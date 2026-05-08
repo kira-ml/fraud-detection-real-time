@@ -10,6 +10,8 @@ import time
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from src.database.connection import get_db_session
+from sqlalchemy import text
 
 import joblib
 import numpy as np
@@ -360,6 +362,66 @@ def save_evaluation_results(
     return output_path
 
 
+def save_metrics_to_database(
+    model_name: str,
+    metrics: Dict[str, Any],
+    dataset_type: str,
+) -> bool:
+    """Save evaluation metrics to monitoring_metrics table.
+    
+    Args:
+        model_name: Name of the evaluated model.
+        metrics: Dictionary of evaluation metrics.
+        dataset_type: 'baseline' or 'advanced'.
+    
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        with get_db_session() as session:
+            metric_rows = [
+                ("pr_auc", metrics.get("pr_auc"), None),
+                ("roc_auc", metrics.get("roc_auc"), None),
+                ("f1_score", metrics.get("f1_score"), None),
+                ("recall", metrics.get("recall"), None),
+                ("precision", metrics.get("precision"), None),
+                ("fpr", metrics.get("false_positive_rate"), None),
+                ("fnr", metrics.get("false_negative_rate"), None),
+            ]
+            
+            for metric_type, metric_value, baseline_value in metric_rows:
+                if metric_value is not None:
+                    session.execute(
+                        text("""
+                            INSERT INTO monitoring_metrics (
+                                model_name, metric_type, metric_value,
+                                baseline_value, deviation_percent,
+                                is_warning, details
+                            ) VALUES (
+                                :name, :mtype, :mval,
+                                :base, 0, false,
+                                :details
+                            )
+                        """),
+                        {
+                            "name": f"{model_name}_{dataset_type}",
+                            "mtype": metric_type,
+                            "mval": float(metric_value),
+                            "base": baseline_value,
+                            "details": json.dumps({
+                                "evaluation_type": "test_set",
+                                "test_samples": metrics.get("test_samples"),
+                                "fraud_count": metrics.get("fraud_caught", 0) + metrics.get("fraud_missed", 0),
+                            })
+                        }
+                    )
+        
+        print(f"[EVALUATE] Metrics saved to monitoring_metrics for {model_name}")
+        return True
+    except Exception as e:
+        print(f"[EVALUATE] WARNING: Failed to save metrics to DB: {e}")
+        return False
+
 # ================================
 # Main Evaluation Pipeline
 # ================================
@@ -462,7 +524,8 @@ def run_evaluation(
             
             # Save results
             save_evaluation_results(metrics, model_name, output_dir)
-            
+            # Save to database
+            save_metrics_to_database(model_name, metrics, dataset_type)
             all_results[model_name] = metrics
             
         except Exception as e:
