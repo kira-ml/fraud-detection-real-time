@@ -3,11 +3,23 @@ Database connection for fraud detection system.
 PostgreSQL 18 on D: drive, port 5433.
 Credentials loaded from .env file — NEVER commit .env to git.
 """
+
+from dotenv import load_dotenv
+load_dotenv()
+
+
+
+
 import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
+
+
+
 import logging
+
+
 
 logger = logging.getLogger(__name__)
 
