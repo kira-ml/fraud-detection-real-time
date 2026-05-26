@@ -2,88 +2,179 @@
 
 ## Project: Real-Time Credit Card Fraud Detection — Full Architecture
 
+### Dataset Profile (Discovered via EDA)
+
+| Property | Value |
+|---|---|
+| Total Transactions | 284,807 |
+| Legitimate Transactions | 284,315 |
+| Fraudulent Transactions | 492 |
+| Fraud Ratio | 0.1727% |
+| Time Range | 0 to 172,792 seconds (~48 hours) |
+| Amount Range | $0.00 to $25,691.16 |
+| Amount Median | $22.00 |
+| Amount Mean | $88.35 |
+| PCA Features | V1–V28 (anonymized, mean ≈ 0, varying std) |
+| Top Fraud-Correlated Features | V17 (-0.33), V14 (-0.30), V12 (-0.26), V10 (-0.22), V16 (-0.20) |
+| Null Values | None detected |
+| Duplicates | To be verified during validation |
+
+---
+
 ### 1. System Overview
 
-This document defines the complete architecture for an end-to-end machine learning pipeline that detects fraudulent credit card transactions at the point of authorization. It covers both a **Baseline** implementation for local development on an Intel Core i5 laptop using Python, Pandas, and Scikit-learn, and an **Advanced** production implementation designed for distributed computing, real-time streaming, and automated operations. Both share identical component boundaries and data contracts, ensuring seamless progression from prototype to production.
+This document defines the complete architecture for an end-to-end machine learning pipeline that detects fraudulent credit card transactions at the point of authorization. It covers both a **Baseline** implementation for local development on an Intel Core i5 laptop and an **Advanced** production implementation. The dataset used is the ULB Credit Card Fraud Detection dataset with 284,807 transactions, 31 columns (Time, V1–V28, Amount, Class), and an extreme class imbalance of 0.17% fraud.
+
+**🟢 UPDATE (2026-05-09):** PostgreSQL 18 database integration complete. All major pipeline components now read from or write to PostgreSQL. See Section 3 for database infrastructure details.
 
 ---
 
-### 2. Design Principles
-
-| Principle | Baseline | Advanced |
-|---|---|---|
-| Compute | Single-node, in-memory | Distributed, cloud-native |
-| Storage | Local filesystem (CSV, Parquet, Pickle) | Cloud object storage, Feature Store, Model Registry |
-| Orchestration | Manual script execution | Airflow / Kubeflow DAGs, CI/CD pipelines |
-| Latency | Not applicable (offline) | Sub-50ms real-time serving |
-| Observability | Console logs, local reports | Dashboards, alerts, automated drift detection |
-| Scaling Path | Identical stage interfaces and data contracts allow drop-in replacement of each component |
-
----
-
-### 3. Pipeline Architecture (Textual Diagram)
+### 2. Pipeline Architecture (Textual Diagram)
 
 ```
-                          ┌──────────────────────────────────────────────────────────────┐
-                          │                     ORCHESTRATION LAYER                       │
-                          │         (Manual scripts → Airflow/Kubeflow DAGs)              │
-                          └──────────────────────────────────────────────────────────────┘
-
-   DATA SOURCES                    PIPELINE STAGES                           SERVING & MONITORING
-   ─────────────                   ────────────────                          ────────────────────
-
- ┌──────────────┐              ┌──────────────────────┐
- │  Raw CSV     │──────────────▶  1. DATA INGESTION   │
- │  Kafka Topic │              └──────────┬───────────┘
- │  S3 Bucket   │                         │
- └──────────────┘                         ▼
-                                ┌──────────────────────┐
-                                │  2. DATA VALIDATION  │──────────────▶ validation_report.json
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │ 3. DATA PREPROCESSING│──────────────▶ scaler.pkl, cleaned.parquet
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │     4. EDA           │──────────────▶ reports/eda/
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │ 5. FEATURE ENGINEER. │──────────────▶ features.parquet, feature_config.json
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │  6. DATA SPLITTING   │──────────────▶ train.parquet, test.parquet
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │  7. MODEL TRAINING   │──────────────▶ model.pkl, model_metadata.json
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │ 8. MODEL EVALUATION  │──────────────▶ evaluation_report.json
-                                └──────────┬───────────┘
-                                          │
-                                          ▼
-                                ┌──────────────────────┐
-                                │  9. MODEL DEPLOYMENT │◀─────── REST/gRPC requests
-                                └──────────┬───────────┘
-                                          │                       ┌──────────────────────┐
-                                          └───────────────────────▶ 10. MONITORING &      │
-                                                                   │     MAINTENANCE      │
-                                                                   └──────────────────────┘
+ ┌──────────────┐
+ │  Raw CSV     │  creditcard.csv (284,807 rows × 31 columns)
+ └──────┬───────┘
+        │
+        ▼
+ ┌──────────────────────┐
+ │  1. DATA INGESTION   │  Pandas read_csv → df_raw → PostgreSQL (284,808 rows)
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  2. DATA VALIDATION  │  Schema, nulls, duplicates, Amount ≥ 0, Class ∈ {0,1}
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │ 3. DATA PREPROCESSING│  StandardScaler on Amount & Time, log transform
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │     4. EDA           │  Class distribution, correlations, time patterns
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │ 5. FEATURE ENGINEER. │  Velocity features (1h, 24h windows), cyclical time
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  6. DATA SPLITTING   │  Time-aware 80/20 split (first 80% time → train)
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  7. MODEL TRAINING   │  SMOTE + Logistic Regression, Decision Tree, Random Forest, XGBoost, LightGBM, MLP
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │ 8. MODEL EVALUATION  │  PR-AUC primary metric → saves to monitoring_metrics table
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────┐
+ │  9. MODEL DEPLOYMENT │  Flask API → localhost:5000/predict → logs to PostgreSQL
+ └──────────┬───────────┘
+            │
+            ▼
+ ┌──────────────────────────────┐
+ │ 10. MONITORING & MAINTENANCE │  DB-sourced drift detection, metrics to monitoring_metrics
+ └──────────────────────────────┘
 ```
 
 ---
 
-### 4. Component Specifications
+### 3. Database Infrastructure (PostgreSQL 18) 🆕
+
+#### Instance Details
+
+| Property | Value |
+|----------|-------|
+| Version | PostgreSQL 18 |
+| Location | D:\PostgreSQL\18\data |
+| Port | 5433 |
+| Database Name | fraud_detection |
+| Connection Module | src/database/connection.py |
+| Schema Definition | src/database/schema.sql |
+| Total Transactions | 284,808 (284,807 original + test predictions) |
+
+#### Tables
+
+| Table | Description | Integration Point |
+|-------|-------------|-------------------|
+| `transactions` | Raw transaction storage (284,808 rows) | ingest.py (bulk), serve.py (real-time) |
+| `predictions` | Model prediction logging | serve.py (every /predict call) |
+| `ground_truth` | Chargeback/feedback labels | record_feedback() function |
+| `model_registry` | Deployed model tracking | Seeded with lightgbm_advanced v1.0 |
+| `monitoring_metrics` | Evaluation + drift metrics | monitor.py, evaluate.py |
+
+#### Analytics Views
+
+| View | Purpose |
+|------|---------|
+| `vw_transaction_results` | Transactions JOIN predictions JOIN ground truth |
+| `vw_daily_performance` | Daily recall, precision, FPR, latency |
+| `vw_model_leaderboard` | Active models ranked by PR-AUC |
+| `vw_recent_alerts` | Last 7 days of drift warnings |
+
+#### Stored Functions
+
+| Function | Purpose |
+|----------|---------|
+| `record_feedback()` | Upsert ground truth labels |
+| `get_model_performance()` | Query metrics by date range |
+
+---
+
+### 4. Database Integration Status 🆕
+
+#### ✅ Completed
+
+| Component | File | What It Does |
+|-----------|------|--------------|
+| Database Setup | PostgreSQL 18 (D:\) | Installed, port 5433, fraud_detection DB |
+| Schema | src/database/schema.sql | 5 tables, 4 views, 2 functions |
+| Connection Module | src/database/connection.py | SQLAlchemy engine + session factory |
+| API → DB Logging | src/serve.py | Every /predict saved to transactions + predictions |
+| Bulk Ingestion | src/ingest.py | 284,807 CSV rows → PostgreSQL |
+| DB-Sourced Monitoring | src/monitor.py | Drift detection from vw_transaction_results |
+| Evaluation Logging | src/evaluation/evaluate.py | Test metrics → monitoring_metrics |
+| Model Registry | model_registry table | lightgbm_advanced v1.0 registered |
+| Ground Truth | record_feedback() | Upsert feedback with conflict handling |
+
+#### 🟡 Medium Priority — To Do
+
+| # | File | What to Change | Why |
+|---|------|---------------|-----|
+| 1 | `src/split.py` | Log split metadata to DB | Track train/test boundaries over time |
+| 2 | `src/models/train_baseline.py` | Auto-register model in model_registry | Traceability for every model trained |
+| 3 | `src/models/train_advanced.py` | Auto-register model in model_registry | Same as above |
+
+#### 🟢 Low Priority — To Do
+
+| # | File | What to Change | Why |
+|---|------|---------------|-----|
+| 4 | `src/preprocess.py` | Save preprocessing metadata to DB | Track scaler/config per model version |
+| 5 | `src/validate.py` | Log validation results to monitoring_metrics | Data quality audit trail |
+| 6 | `config/pipeline_config.yaml` | Add DB connection section | Centralize database settings |
+
+#### 🔮 Future — Graph-Based Models
+
+| Task | Purpose |
+|------|---------|
+| Add `card_id`, `merchant_id` to transactions | Entity resolution for graph edges |
+| Build bipartite graph (card ↔ merchant) | Detect fraud rings, botnets |
+| Train GNN / GraphSAGE | Coordinated fraud detection |
+| Extract graph features → feed into LightGBM | Hybrid modeling approach |
+
+---
+
+### 3. Component Specifications
 
 ---
 
@@ -91,31 +182,35 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A minimal file-reader module that loads the raw dataset from a local CSV file into a Pandas DataFrame. This module acts as a single point of entry for offline development and experimentation on a laptop with limited memory.
+**Description:** A minimal file-reader module that loads the raw ULB Credit Card Fraud Detection CSV file into a Pandas DataFrame. The dataset contains 284,807 transactions with 31 columns: `Time` (seconds elapsed), `V1`–`V28` (PCA-transformed features), `Amount` (transaction amount in local currency), and `Class` (0 = legitimate, 1 = fraud).
+
+**🟢 UPDATE:** Now supports bulk loading to PostgreSQL via the `load_to_database()` function. All 284,807 rows migrated successfully.
 
 **Responsibilities:**
-- Read a CSV file path provided via a configuration variable (`config/pipeline_config.yaml`).
-- Perform a quick sanity check on number of rows and columns loaded, reporting memory usage.
+- Read the CSV file path from `config/pipeline_config.yaml`.
+- Perform a quick sanity check: confirm 284,807 rows and 31 columns loaded.
+- Report memory usage and column schema to console.
 - Return a DataFrame object for downstream steps.
+- **NEW:** Optionally bulk insert into PostgreSQL `transactions` table (batch size: 5,000).
 
-**Input:** A file path string (`data/raw/creditcard.csv`) pointing to a local CSV. The CSV contains columns like `Time`, `Amount`, `Class`, PCA features `V1`–`V28`.
+**Input:** A file path string (`data/raw/creditcard.csv`). The CSV contains no header issues; all 31 columns are numeric (float64 for V1–V28, Amount, Time; int64 for Class).
 
-**Output:** A pandas DataFrame object held in memory, containing all raw rows and columns as they appear in the file (`df_raw`). Schema: float64 for numeric features, int64 for `Class`. Console log confirms row count and memory footprint.
+**Output:** `df_raw` — a Pandas DataFrame (284,807 rows × 31 columns). Schema: `Time` (float64), `V1`–`V28` (float64), `Amount` (float64), `Class` (int64).
 
 ### Advanced Approach
 
-**Description:** A scalable ingestion service that supports both batch historical loads and real-time streaming. It abstracts the data source, allowing seamless switching between a data lake and a message queue while ensuring exactly-once semantics.
+**Description:** A scalable ingestion service that supports both batch historical loads and real-time streaming from payment gateways. Abstracts the data source, allowing seamless switching between a data lake and a message queue while ensuring exactly-once semantics with transaction IDs.
 
 **Responsibilities:**
-- Batch ingestion from cloud object storage (S3/GCS) using Apache Spark or Dask for parallel reads.
+- Batch ingestion from cloud object storage (S3/GCS) using Apache Spark or Dask for parallel reads of partitioned Parquet files.
 - Real-time ingestion from Kafka topics (`transactions.raw`) with Avro schema validation, using a schema registry.
-- Idempotent record handling using transaction IDs to avoid duplicates.
-- Publish raw events to a staging area (data lake zone / Kafka dead-letter queue on failure).
-- Automatically register data schema and version in a metadata store (e.g., Hive Metastore or AWS Glue Catalog).
+- Idempotent record handling using transaction IDs to avoid duplicates during reprocessing.
+- Publish raw events to a staging area (data lake raw zone) and route failures to a dead-letter queue.
+- Automatically register data schema and version in a metadata store (Hive Metastore or AWS Glue Catalog).
 
-**Input:** Source identifiers: an S3 prefix pattern (e.g., `s3://fraud-lake/raw/yyyy/mm/dd/`) or a Kafka bootstrap server and topic. Schema definition from a central schema registry (e.g., Apicurio, Confluent).
+**Input:** Source identifiers: an S3 prefix pattern (`s3://fraud-lake/raw/dt=YYYY-MM-DD/`) or a Kafka bootstrap server and topic. Schema definition from a central schema registry (Apicurio, Confluent).
 
-**Output:** A distributed DataFrame (Spark/Dask) for batch, or a structured streaming DataFrame for real-time. Events are also persisted to a raw zone in Parquet format with partition key `dt=YYYY-MM-DD` for query efficiency.
+**Output:** A distributed DataFrame (Spark/Dask) for batch processing, or a structured streaming DataFrame for real-time. Events persisted to a raw zone in Parquet format partitioned by `dt=YYYY-MM-DD`.
 
 ---
 
@@ -123,33 +218,35 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A lightweight validation script that checks basic expectations about the dataset before preprocessing. It uses the `pandera` library to define schema constraints in code.
+**Description:** A lightweight validation script using `pandera` that checks basic expectations against the raw DataFrame. Ensures the dataset matches the known ULB schema before any processing occurs.
 
 **Responsibilities:**
-- Verify that all required columns exist (`Time`, `V1`–`V28`, `Amount`, `Class`).
-- Check that `Amount` is non-negative.
-- Check that `Class` is either 0 or 1.
-- Report number of null values per column.
-- Raise `ValidationError` if critical constraints fail, halting the pipeline.
+- Verify all 31 columns exist: `Time`, `V1`–`V28`, `Amount`, `Class`.
+- Check data types: all columns are numeric (float64 or int64).
+- Validate `Amount` >= 0 (no negative transaction amounts allowed).
+- Validate `Class` is strictly 0 or 1.
+- Check for null values in all columns (expected: 0 nulls).
+- Check for duplicate rows and report count.
+- Halt pipeline with `ValidationError` if critical constraints fail.
 
-**Input:** The raw DataFrame from Data Ingestion.
+**Input:** The raw DataFrame from Data Ingestion (`df_raw`).
 
-**Output:** A validation report (`reports/validation_report.json`) with pass/fail status per expectation. The unchanged DataFrame if validation passes; otherwise raises an exception with details.
+**Output:** `reports/validation_report.json` — pass/fail status per expectation including duplicate count and null summary. The unchanged DataFrame if validation passes.
 
 ### Advanced Approach
 
-**Description:** A full data contract enforcement layer using Great Expectations (GE) integrated into the CI/CD pipeline. Validation runs automatically every time new data lands, with results stored for auditing and anomaly detection.
+**Description:** A full data contract enforcement layer using Great Expectations (GE) integrated into CI/CD pipelines. Validation runs automatically on every data landing event, with results stored for auditing and drift detection.
 
 **Responsibilities:**
-- Define a suite of expectations: column existence, types, value ranges (e.g., `Amount` between 0 and 25,000), null proportions < 5%, distribution shifts vs. reference window.
+- Define a comprehensive expectation suite: column existence, types, value ranges (Amount 0–25,000 based on observed max of 25,691), null proportions = 0%, distribution of `Class` (fraud ratio ~0.15–0.20%).
 - Run validation as a pre-commit hook in the feature pipeline and as a step in an orchestrated DAG (Airflow/Prefect).
-- Publish validation results to a data quality dashboard (e.g., GE Data Docs on S3) and send alerts (Slack, PagerDuty) on failure.
-- Perform time-window comparisons (e.g., Kolmogorov-Smirnov test on `Amount` distribution vs. last week) to catch concept drift early.
-- Store validation artifacts (expectation suites, checkpoint results) in a versioned object store.
+- Publish validation results to a data quality dashboard (GE Data Docs on S3) and send alerts (Slack/PagerDuty) on failure.
+- Perform time-window comparisons: Kolmogorov-Smirnov test on `Amount` distribution and PCA feature distributions vs. reference window to catch concept drift.
+- Store expectation suites and checkpoint results in a versioned object store.
 
-**Input:** A DataFrame from batch/streaming Data Ingestion, plus a GE expectation suite JSON and checkpoint configuration.
+**Input:** DataFrame from batch/streaming Data Ingestion, plus a GE expectation suite JSON and checkpoint configuration.
 
-**Output:** A validation result document (JSON) with detailed per-expectation outcomes, success/failure flags, and distribution diagnostic plots uploaded to cloud storage. Downstream steps only proceed if critical validations pass.
+**Output:** A validation result document (JSON) with per-expectation outcomes, success/failure flags, and distribution diagnostic plots. Downstream steps only proceed if critical validations pass.
 
 ---
 
@@ -157,34 +254,35 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A straightforward script that handles missing values, scales numerical features, and prepares the data for modeling with minimal memory footprint. All operations are performed eagerly on a pandas DataFrame.
+**Description:** A straightforward script that scales numerical features and prepares data for modeling. Since the ULB dataset is pre-cleaned (no nulls, PCA already applied), the focus is on scaling `Time` and `Amount` to match the PCA features' scale.
 
 **Responsibilities:**
-- Impute missing values: replace NaNs in PCA features with 0 (common for anonymized data) and in `Amount` with median if needed.
-- Apply `StandardScaler` to `Amount` and `Time`; PCA features (`V1`–`V28`) are already scaled but may be re-normalized if needed.
-- Remove duplicate rows based on transaction identifiers if present.
-- Drop any rows with impossible values (negative `Amount` if found despite validation).
-- Encode `Class` as integer labels.
+- No null imputation needed (dataset confirmed clean during validation).
+- Remove duplicate rows if any were detected during validation.
+- Apply `StandardScaler` to `Amount` and `Time` features (fit on training data only, but for baseline we scale the full dataset for exploration).
+- PCA features (`V1`–`V28`) are already centered and scaled (mean ≈ 0, std ≈ 1); no additional scaling required.
+- Apply `RobustScaler` as an alternative to `Amount` given its extreme skew (mean 88, median 22, max 25,691) to reduce outlier influence.
+- Save the fitted scaler for inference.
 
 **Input:** Validated DataFrame.
 
-**Output:** `data/processed/cleaned.parquet` — a cleaned pandas DataFrame with exactly the same columns, now free of nulls and with numeric features standardized. `artifacts/scaler.pkl` — fitted scaler object saved for later use during inference.
+**Output:** `data/processed/cleaned.parquet` — DataFrame with scaled `Amount` and `Time`, original PCA features. `artifacts/scaler.pkl` — fitted scaler object.
 
 ### Advanced Approach
 
-**Description:** A modular preprocessing pipeline that runs as a series of stateless transformations in a distributed compute framework and supports point-in-time correctness. It is designed for both batch training and real-time serving.
+**Description:** A modular preprocessing pipeline that runs as a series of stateless transformations in a distributed framework, supporting point-in-time correctness for both batch training and real-time serving.
 
 **Responsibilities:**
-- Use Apache Spark ML Pipelines or a Scikit-learn pipeline packaged inside a serverless function (e.g., AWS Lambda with a feature transformation container) for portability.
-- Apply consistent imputation strategies stored in the feature store metadata: PCA nulls → 0, categorical nulls → a special token.
-- Scale features using statistics computed only on the training set (precomputed and stored in a configuration store).
-- Handle categorical features (if dataset version includes MCC, terminal type) using one-hot or target encoding with smoothing, avoiding data leakage by fitting on a holdout split.
-- Log every transformation step and its parameters in MLflow for lineage tracking.
-- Output transformation artifacts (scaler, imputer, encoder) as serialized objects in a model registry (MLflow Model).
+- Use Apache Spark ML Pipelines or a containerized Scikit-learn pipeline for portability across training and serving.
+- Apply `Amount` scaling using statistics computed only on the training set (precomputed and stored in a configuration store).
+- `Amount` log transformation: `Amount_log = log(Amount + 1)` to handle the extreme right skew (median $22 vs max $25,691).
+- Handle any new categorical features (MCC, terminal type) using one-hot or target encoding with smoothing, fit on a holdout to prevent leakage.
+- Log every transformation step with parameters in MLflow for lineage tracking.
+- Output transformation artifacts (scaler, encoder) as versioned objects in MLflow Model Registry.
 
-**Input:** Cleaned DataFrame (batch view from Spark/Dask), plus configuration referencing a pre-existing train/validation split time boundary to prevent future information leakage.
+**Input:** Validated DataFrame (batch from Spark/Dask), plus configuration referencing train/validation split boundary.
 
-**Output:** A transformed dataset saved in columnar format (Parquet) partitioned by date, and a serialized preprocessing pipeline saved as an MLflow artifact with versioning. During serving, the same pipeline is applied in the model server.
+**Output:** Transformed dataset in Parquet partitioned by date, and a serialized preprocessing pipeline in MLflow with versioning. The identical pipeline is applied in the model server during inference.
 
 ---
 
@@ -192,34 +290,36 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** An interactive Jupyter notebook that generates basic descriptive statistics and visualizations to understand the data. The output is a manually reviewed set of plots and tables, not part of the automated pipeline.
+**Description:** A script that generates descriptive statistics and visualizations to understand the ULB dataset's characteristics. Based on actual EDA findings: 284,807 transactions, 492 fraud cases (0.17%), top fraud-correlated features identified as V17, V14, V12, V10, V16.
 
 **Responsibilities:**
-- Print class distribution: count and percentage of fraud (`Class=1`).
-- Compute summary statistics for `Amount` and `Time`.
-- Plot histograms of transaction amounts split by fraud vs. non-fraud.
-- Plot a correlation heatmap of PCA features (`V1`–`V28`) to spot highly correlated dimensions.
-- Check for time-based patterns: fraud rate by hour of day (derived from `Time` feature).
-- Display a table of missing values per column.
+- Print class distribution: 284,315 legitimate (99.83%), 492 fraud (0.17%).
+- Compute summary statistics: `Amount` (mean $88.35, median $22.00, max $25,691.16), `Time` (range 0–172,792 seconds ≈ 48 hours).
+- Plot histogram of `Amount` by class (fraud vs. non-fraud) — note extreme skew and differing distributions.
+- Plot correlation heatmap focused on V1–V28 with `Class`, highlighting top features: V17 (-0.33), V14 (-0.30), V12 (-0.26), V10 (-0.22).
+- Plot fraud frequency by hour of day derived from `Time` (48-hour window allows 2 daily cycles).
+- Display top 15 features ranked by absolute correlation with `Class`.
+- Run PCA variance analysis to confirm dimensionality reduction potential.
 
 **Input:** `data/processed/cleaned.parquet` from Data Preprocessing.
 
-**Output:** A set of PNG images and HTML tables saved in `reports/eda/`, plus key insights documented in the notebook's markdown cells.
+**Output:** PNG figures saved to `reports/eda/` (class_distribution.png, amount_histogram.png, correlation_heatmap.png, fraud_by_hour.png, feature_correlation_ranking.csv). Key findings logged to console.
 
 ### Advanced Approach
 
-**Description:** Automated, scheduled EDA that produces a comprehensive data profile and drift report with minimal human intervention. The results are versioned and shared as an interactive dashboard.
+**Description:** Automated, scheduled EDA producing comprehensive data profiles and drift reports. Compares current data distributions against the training reference to detect shifts.
 
 **Responsibilities:**
-- Run `pandas_profiling` or `Sweetviz` on a scheduled cadence (daily) over the recent batch of transactions.
-- Compare current data distribution with a reference profile (e.g., from the training window) to highlight feature drift.
-- Automatically detect target distribution changes (fraud rate shift) and flag if the imbalance ratio deviates by more than 20% from baseline.
-- Generate interactive HTML reports and upload to a shared cloud storage or a BI tool (e.g., a Databricks notebook dashboard).
-- Trigger alerts if unexpected patterns (e.g., sudden spike in zero amounts, new dominant merchant categories) appear.
+- Run `Sweetviz` or `pandas_profiling` on a daily schedule over the recent batch of transactions.
+- Compare current distributions with reference profile from training window (281K legit, 492 fraud, fraud ratio 0.17%).
+- Flag if fraud ratio deviates by >20% from baseline (outside 0.14–0.21% range).
+- Monitor top fraud-correlated features (V17, V14, V12, V10) for distribution drift using PSI.
+- Generate interactive HTML reports uploaded to cloud storage or Databricks dashboard.
+- Trigger alerts if unexpected patterns emerge (e.g., new clusters in PCA space, Amount distribution shift).
 
-**Input:** Batch DataFrame from the cleaned data store, plus a reference profile JSON (generated during initial model training).
+**Input:** Batch DataFrame from cleaned data store, plus reference profile JSON from initial training run.
 
-**Output:** A detailed EDA report (HTML/JSON) saved to a cloud bucket with a timestamped path. Key metrics (fraud rate, missing percentages, drift p-values) are logged to MLflow as artifacts for traceability.
+**Output:** Timestamped EDA report (HTML/JSON) in cloud storage. Key metrics (fraud rate, missing percentages, drift p-values per feature) logged to MLflow.
 
 ---
 
@@ -227,38 +327,40 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A Pandas-based feature transformer that creates simple aggregated velocity features using rolling windows on transaction history. All calculations are done in-memory on the historical dataset for training.
+**Description:** A Pandas-based feature transformer that creates temporal and velocity features from the `Time` column. Since the ULB dataset lacks user/card identifiers, all velocity features are computed globally over rolling time windows.
 
 **Responsibilities:**
-- Sort data by `Time` and compute global temporal features (public datasets lack user/card IDs).
-- Create time-based features: `hour` (0–23), `day` (integer), `hour_sin`, `hour_cos` (cyclical encoding).
-- Create rolling-window velocity features using Pandas `.rolling()`:
-  - `txn_count_1h`: count of transactions in the last 3600 seconds.
-  - `txn_count_24h`: count of transactions in the last 86400 seconds.
-  - `avg_amount_1h`: average transaction amount in the last 3600 seconds.
-  - `avg_amount_24h`: average transaction amount in the last 86400 seconds.
-- Add `Amount_log` = `log(Amount + 1)` for better scaling.
-- Produce a final feature set that combines original PCA features with newly engineered features.
+- Convert `Time` (seconds) into `hour` (0–47 over 48-hour window) and `day` (0 or 1).
+- Create cyclical time features: `hour_sin = sin(2π × hour / 24)`, `hour_cos = cos(2π × hour / 24)`.
+- Sort by `Time`, then compute global rolling-window features using Pandas `.rolling()`:
+  - `txn_count_1h`: count of transactions in the prior 3,600 seconds.
+  - `txn_count_24h`: count of transactions in the prior 86,400 seconds.
+  - `avg_amount_1h`: mean transaction amount in prior 3,600 seconds.
+  - `avg_amount_24h`: mean transaction amount in prior 86,400 seconds.
+  - `std_amount_1h`: standard deviation of amounts in prior 3,600 seconds.
+- Apply log transform: `Amount_log = log(Amount + 1)`.
+- Keep the top 10 fraud-correlated PCA features highlighted in EDA (V17, V14, V12, V10, V16, V3, V7, V11, V4, V18) and drop low-correlation features if dimensionality reduction is desired.
+- Drop original `Time` column before training.
 
-**Input:** `data/processed/cleaned.parquet` with a `Time` column (seconds from first transaction). Feature configuration specifying window sizes (3600, 86400).
+**Input:** `data/processed/cleaned.parquet` with `Time` column still present.
 
-**Output:** `data/processed/features.parquet` — a pandas DataFrame with all original and new columns. `artifacts/feature_config.json` — list of feature names used for training.
+**Output:** `data/processed/features.parquet` — DataFrame with original features plus engineered features. `artifacts/feature_config.json` — list of final feature column names used for training.
 
 ### Advanced Approach
 
-**Description:** A Feature Store-based pipeline that decouples feature computation from model training and ensures point-in-time correctness for historical and real-time features. Velocity features are precomputed at scale using stream processing or batch windows and stored for online serving.
+**Description:** A Feature Store-based pipeline (Feast/Tecton) that decouples feature computation from model training. Velocity features are precomputed at scale using stream processing and stored for low-latency online serving.
 
 **Responsibilities:**
-- Maintain an offline feature store (e.g., Feast, Tecton) where all features are registered and versioned.
-- Compute batch velocity features using Spark SQL or Flink: aggregate sessions per card ID over sliding windows of 1h, 6h, 24h, 7d — counts, mean amounts, max amounts, standard deviations.
-- Store those features in a feature group with event timestamps, ensuring training uses only features available at the time of each transaction (no look-ahead bias).
-- For real-time inference, serve the latest precomputed features from an online store (Redis/DynamoDB) and compute on-the-fly features (e.g., current transaction amount deviation from 1h moving average) in the model server.
-- Include advanced transformations: PCA feature cross-products (interactions), cluster distances from an anomaly detector (e.g., distance to nearest Isolation Forest centroid as a feature), and rolling standard deviation of spending.
-- Automate feature registration and documentation through a CI/CD step that runs feature validations (min/max values, lack of nulls) before promoting to production.
+- Maintain an offline feature store where all features are registered and versioned.
+- Compute velocity features using Spark SQL or Flink: per-card-ID aggregations over sliding windows of 1h, 6h, 24h, 7d — counts, mean/std/max amounts, transaction frequency, time since last transaction.
+- Store features with event timestamps for point-in-time correct training (no look-ahead bias).
+- For real-time inference, serve precomputed features from an online store (Redis/DynamoDB) and compute stream features (current amount deviation from 1h average) in the model server.
+- Advanced features: interaction terms between top PCA features (V17×V14, V12×V10), Isolation Forest anomaly scores as a feature, recency-frequency metrics.
+- Automate feature validation (min/max values, non-null checks) in CI/CD before promotion.
 
-**Input:** Streaming transaction events (Kafka) with card/user identifiers, and batch historical tables in the data lake. Feature registry YAML defining feature views and entities.
+**Input:** Streaming transaction events (Kafka) with card/user identifiers, plus batch historical tables. Feature registry YAML defining feature views and entities.
 
-**Output:** Offline feature dataset (in Parquet) for training, with a historical feature retrieval API. Online feature vectors returned by the feature server at serving time (<10 ms). All feature engineering code versioned and stored as a Feast Feature Repository.
+**Output:** Offline feature dataset (Parquet) for training via historical retrieval API. Online feature vectors from feature server at serving time (<10 ms). Feature engineering code versioned as a Feast Feature Repository.
 
 ---
 
@@ -266,33 +368,35 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A simple time-aware split that divides the dataset into training and test sets based on a temporal cutoff. The final portion of time becomes the holdout set, mimicking production deployment conditions.
+**Description:** A time-aware chronological split that divides the 48-hour dataset into training and test sets. The first 80% of the time range (0–138,233 seconds) becomes training; the remaining 20% (138,234–172,792 seconds) becomes the holdout test set.
 
 **Responsibilities:**
-- Sort transactions by `Time` (seconds elapsed since first transaction).
-- Determine a split timestamp such that the first 80% of the time range is training, the remaining 20% is testing.
-- Ensure no data leakage: all transactions in training occur before the earliest test transaction.
-- Save the resulting DataFrames and record the split timestamp.
+- Sort transactions by `Time` ascending.
+- Calculate split timestamp: 80% of max `Time` value = 0.80 × 172,792 = 138,233 seconds.
+- Training set: all transactions where `Time` ≤ 138,233.
+- Test set: all transactions where `Time` > 138,233.
+- Verify no temporal leakage: max training `Time` < min test `Time`.
+- Report class distribution in each split to confirm fraud ratio is preserved (~0.17% in both).
 
-**Input:** `data/processed/features.parquet` with the `Time` column still present for splitting logic.
+**Input:** `data/processed/features.parquet` with `Time` column for splitting logic.
 
-**Output:** `data/processed/train.parquet` and `data/processed/test.parquet`, each with the same feature columns. `config/split_timestamp.txt` recording the boundary value.
+**Output:** `data/processed/train.parquet` and `data/processed/test.parquet`. `config/split_timestamp.txt` recording the boundary value (138,233 seconds).
 
 ### Advanced Approach
 
-**Description:** A robust, automated splitting strategy that uses time-series cross-validation for model selection and a holdout window that respects real-world deployment delay and fraud label reporting lag.
+**Description:** A robust, automated time-series cross-validation strategy with delay-aware splits that account for fraud reporting lag in production.
 
 **Responsibilities:**
-- Perform time-series split with multiple backtesting folds (e.g., expanding window, 3 folds). For each fold, train on data up to time T, validate on data in [T, T+delta].
-- Automatically select the split intervals using a scheduling configuration (e.g., train on 12 weeks, validate on next 2 weeks).
-- Implement a "delay-aware" split: exclude transactions that would not yet be labeled due to fraud reporting lag (simulating real-world reporting delay of 1–3 days). The validation set does not include the most recent unlabeled data.
-- Use stratified sampling within the validation window to maintain fraud prevalence, if necessary.
-- Save split metadata (timestamps, fold assignments) in a versioned artifact to be reused in evaluation.
-- Integrate with a feature store to retrieve point-in-time correct feature views for each fold.
+- Perform expanding-window cross-validation with 3 folds over the time series.
+- Each fold: train on [0, T], validate on [T, T+delta] where delta represents a deployment cycle (e.g., 6 hours given the 48-hour dataset).
+- Implement delay-aware split: exclude the most recent 3,600 seconds (1 hour) from validation to simulate fraud label reporting delay.
+- Use stratified sampling within validation windows to maintain the 0.17% fraud prevalence.
+- Save split metadata (timestamps, fold assignments) as versioned artifacts for reproducible evaluation.
+- Integrate with feature store for point-in-time correct feature retrieval per fold.
 
-**Input:** Feature store's historical feature set with timestamps, plus a configuration YAML specifying fold durations, reporting delay, and test window.
+**Input:** Feature store historical feature set with timestamps, plus configuration YAML specifying fold durations and reporting delay.
 
-**Output:** A set of training and validation DataFrames per fold stored in Parquet, along with a holdout test set for final evaluation. A timestamp boundary map is logged to MLflow for reproducibility.
+**Output:** Per-fold training and validation DataFrames in Parquet, plus a holdout test set. Timestamp boundary map logged to MLflow.
 
 ---
 
@@ -300,37 +404,40 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A single Python script that trains three baseline classifiers using Scikit-learn on the local training set. It handles class imbalance with SMOTE oversampling and uses simple 3-fold cross-validation for model selection.
+**Description:** A single Python script training three baseline classifiers with Scikit-learn. Handles the 0.17% fraud ratio using SMOTE oversampling during cross-validation. Uses 3-fold cross-validation on the 80% training split for model selection.
 
 **Responsibilities:**
-- Load `train.parquet`; separate `X_train` (drop `Class`, `Time`) and `y_train`.
-- Apply SMOTE (from imbalanced-learn) to the training folds to balance classes.
-- Perform 3-fold cross-validation for each candidate: Logistic Regression, Decision Tree (max_depth=5), Random Forest (n_estimators=50).
-- Compare mean PR-AUC across folds and select the best algorithm.
-- Retrain the best model on the full training set.
-- Serialize the best model.
+- Load `train.parquet`; separate `X_train` (all features except `Class`, `Time`) and `y_train`.
+- Apply SMOTE (imbalanced-learn) to balance classes in each training fold (synthesizing fraud examples to match legitimate count).
+- Train three candidates with 3-fold cross-validation:
+  - Logistic Regression (baseline linear, high interpretability).
+  - Decision Tree (max_depth=5, captures simple non-linear rules).
+  - Random Forest (n_estimators=50, max_depth=10, robust ensemble).
+- Compare mean PR-AUC across folds (primary metric due to 0.17% imbalance).
+- Retrain best model on full training set.
+- Serialize with joblib.
 
-**Input:** `data/processed/train.parquet` from Data Splitting.
+**Input:** `data/processed/train.parquet` (~227,845 rows, 80% of 284,807).
 
-**Output:** `artifacts/model.pkl` — serialized Scikit-learn model (pipeline including scaler if embedded). `artifacts/model_metadata.json` — selected algorithm, hyperparameters, feature list, and CV PR-AUC.
+**Output:** `artifacts/model.pkl` — Scikit-learn model. `artifacts/model_metadata.json` — selected algorithm, hyperparameters, feature list, CV PR-AUC score.
 
 ### Advanced Approach
 
-**Description:** A fully orchestrated training pipeline with experiment tracking, distributed hyperparameter tuning, and model selection using a model registry. Supports multiple model types including gradient boosting and neural networks.
+**Description:** A fully orchestrated training pipeline with experiment tracking, distributed hyperparameter tuning, and model registry integration. Trains multiple model types optimized for low-latency inference.
 
 **Responsibilities:**
-- Use an orchestrator (Airflow / Kubeflow Pipelines) that triggers training on new labeled data or on a schedule.
-- Load features from the offline feature store using point-in-time joins.
-- Handle severe class imbalance via a combination of SMOTE, cost-sensitive learning (`scale_pos_weight` in XGBoost), and downsampling with probability calibration.
-- Execute hyperparameter optimization with Optuna or Hyperopt across a cluster (e.g., distributed on Kubernetes), exploring XGBoost, LightGBM, and a small MLP (in TensorFlow/PyTorch) with tree-structured Parzen Estimators.
-- Train an Isolation Forest for anomaly detection on the non-fraud class to generate an anomaly score feature later.
-- Use MLflow to track all experiments: parameters, metrics, feature importance, and the resulting model artifact.
-- Register the best candidate in the MLflow Model Registry, promote to "Staging" after passing evaluation thresholds.
-- Store the model in a format conducive to low-latency deployment: XGBoost native format, ONNX, or compiled with `treelite`.
+- Use Airflow/Kubeflow Pipelines triggering training on new labeled data or schedule.
+- Load features from offline feature store using point-in-time joins.
+- Handle extreme class imbalance (0.17%) via combined strategy: SMOTE + cost-sensitive learning (`scale_pos_weight` ~578 in XGBoost = 284,315/492) + probability calibration.
+- Distributed hyperparameter optimization with Optuna across Kubernetes, exploring XGBoost, LightGBM, and a small MLP.
+- Train Isolation Forest on legitimate transactions to produce anomaly scores as supplementary features.
+- Track all experiments in MLflow: parameters, PR-AUC, feature importance, model artifacts.
+- Register best model in MLflow Model Registry → "Staging" after passing evaluation gates.
+- Export to low-latency format: ONNX or Treelite-compiled XGBoost for microsecond inference.
 
-**Input:** Feature view from feature store (offline), training configuration YAML (hyperparameter search space, algorithms to include, objective metric PR-AUC).
+**Input:** Feature view from offline feature store, training configuration YAML (hyperparameter search space, objective = PR-AUC).
 
-**Output:** A registered model version in MLflow with production-ready artifacts (ONNX or `model.bst`), a complete set of training logs, and a model card documenting performance and fairness metrics.
+**Output:** Registered model version in MLflow with ONNX artifact, complete training logs, feature importance plot, model card with performance and fairness metrics.
 
 ---
 
@@ -338,35 +445,41 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A script that loads the test set and the trained model to compute essential performance metrics, with a focus on PR-AUC due to extreme class imbalance. Results are printed and saved to a JSON file.
+**Description:** A script evaluating the trained model on the held-out 20% test set (~56,962 transactions). Prioritizes PR-AUC due to the 0.17% class imbalance and determines an optimal decision threshold.
+
+**🟢 UPDATE:** Now saves evaluation metrics directly to the `monitoring_metrics` PostgreSQL table via `save_metrics_to_database()`. Seven metrics are logged per evaluation: pr_auc, roc_auc, f1_score, recall, precision, fpr, fnr. Each entry includes metadata (test_samples, fraud_count, evaluation_type).
 
 **Responsibilities:**
 - Load `test.parquet` and `model.pkl`.
-- Generate predictions and probability scores on the test set.
-- Compute PR-AUC, ROC-AUC, and precision, recall, F1 at default threshold 0.5.
-- Determine a threshold that achieves a target recall of 80% (or a fixed false positive rate of 1%) and report precision at that threshold.
-- Generate and save a confusion matrix at the selected threshold.
+- Generate fraud probability scores for all test transactions.
+- Compute PR-AUC (primary metric), ROC-AUC (secondary reference).
+- Compute precision, recall, F1 at default threshold 0.5.
+- Find threshold achieving 80% recall (captures 80% of fraud) and report precision and false positive rate at that threshold.
+- Find threshold achieving 1% false positive rate and report recall.
+- Generate confusion matrix at selected deployment threshold.
+- Save all metrics and the recommended threshold.
+- **NEW:** Persist metrics to `monitoring_metrics` table in PostgreSQL.
 
-**Input:** `data/processed/test.parquet` and `artifacts/model.pkl`.
+**Input:** `data/processed/test.parquet` (~56,962 rows), `artifacts/model.pkl`.
 
-**Output:** `reports/evaluation_report.json` — file with all computed metrics (PR-AUC, ROC-AUC, precision@80recall, FPR@80recall, optimal_threshold). `reports/confusion_matrix.csv`.
+**Output:** `reports/evaluation_report.json` (PR-AUC, ROC-AUC, precision@80recall, FPR@80recall, threshold@80recall, threshold@1fpr). `reports/confusion_matrix.csv`. Database: `monitoring_metrics` table updated.
 
 ### Advanced Approach
 
-**Description:** A multi-faceted evaluation harness that simulates production conditions, computes business impact metrics, and validates model performance across data slices before promotion to production.
+**Description:** A multi-faceted evaluation harness simulating production conditions with business impact metrics and slice-level performance validation.
 
 **Responsibilities:**
-- Perform time-series aware backtesting: evaluate each fold from cross-validation and aggregate metrics.
-- Compute business metrics: estimated fraud loss saved = fraud detected × average transaction amount × (1 − chargeback rate), and false positive rate translating to customer insult rate.
-- Slice evaluation: performance by transaction amount buckets, hour of day, merchant category (if available) to ensure no biased degradation for specific segments.
-- A/B test shadow deployment: log production traffic predictions from the challenger model and compare against the current champion model without affecting decisions; compute evaluation on these shadow logs.
-- Generate a model validation report in HTML format with drift detection insights (population stability index, feature drift).
-- Implement a gating function: if test PR-AUC drops more than 5% relative to the previous champion, or false positive rate exceeds 2%, block auto-promotion.
-- Store evaluation artifacts in MLflow and update the model registry stage (Staging → Production or Archived).
+- Time-series backtesting: aggregate metrics across all cross-validation folds.
+- Compute business metrics: fraud loss saved (fraud detected × $88.35 avg amount), customer insult rate (false positive %), estimated operational cost of review queue.
+- Slice evaluation: performance by Amount buckets ($0–22, $22–100, $100–500, $500+), hour of day, day 0 vs day 1.
+- Shadow deployment: log challenger model predictions on live traffic, compare to champion offline; promote only if PR-AUC improves ≥2%.
+- Generate HTML validation report with drift insights (PSI per feature, prediction distribution shift).
+- Gating function: block promotion if PR-AUC drops >5% vs champion or false positive rate exceeds 2%.
+- Store evaluation artifacts in MLflow, update registry stage (Staging → Production or Archived).
 
-**Input:** Model artifact from training, test set (holdout), and optionally streaming production logs for shadow evaluation. Configuration file specifying thresholds and slice definitions.
+**Input:** Model artifact, holdout test set, optional shadow production logs.
 
-**Output:** A comprehensive evaluation report (JSON/HTML) with slice-level metrics and business KPIs, a decision flag (`promote: true/false`), and an updated model registry stage.
+**Output:** Comprehensive evaluation report (JSON/HTML) with slice metrics, business KPIs, `promote: true/false` flag, updated model registry stage.
 
 ---
 
@@ -374,35 +487,38 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A local REST API built with Flask that loads the serialized model and serves fraud predictions on single transaction requests. It runs on the laptop to mimic a real-time authorization endpoint for testing.
+**Description:** A Flask REST API serving fraud predictions locally on `localhost:5000`. Loads the serialized model and scaler, applies identical preprocessing to incoming requests, and returns fraud probabilities.
+
+**🟢 UPDATE:** Now logs every prediction to PostgreSQL. Each `/predict` call inserts a row into `transactions` and `predictions` tables, enabling full audit trail and enabling DB-sourced monitoring. Database logging is non-blocking — API continues serving even if DB is temporarily unavailable.
 
 **Responsibilities:**
 - Load `model.pkl` and `scaler.pkl` into memory on startup.
-- Expose a `/predict` POST endpoint that accepts a JSON payload with feature values.
-- Apply the same preprocessing and feature engineering steps identical to training (scale `Amount`, compute cyclical time, etc.).
-- Return a JSON response with `fraud_probability` and `is_fraud` using the tuned threshold from evaluation.
-- Log each request and prediction to `logs/service.log` for later analysis.
+- Expose POST `/predict` endpoint accepting JSON transactions.
+- Apply preprocessing: scale `Amount` using loaded scaler, compute `Amount_log`, `hour_sin/cos`, velocity features from request context.
+- Return `{"fraud_probability": 0.92, "is_fraud": true/false}` using the threshold selected during evaluation.
+- Log every request to `logs/service.log` with timestamp, input hash, and prediction.
+- **NEW:** Log every request to PostgreSQL `transactions` + `predictions` tables.
 
-**Input:** HTTP POST request to `http://localhost:5000/predict` with a JSON body: `{"Time": 150000, "V1": -1.5, ..., "V28": 0.3, "Amount": 120.0}`.
+**Input:** POST `http://localhost:5000/predict` — JSON body: `{"Time": 150000, "V1": -1.5, ..., "V28": 0.3, "Amount": 120.0}`.
 
-**Output:** JSON response: `{"fraud_probability": 0.92, "is_fraud": true}`. Service runs as a single-process Flask development server.
+**Output:** JSON response: `{"fraud_probability": 0.92, "is_fraud": true, "transaction_id": "547066...", "model": "lightgbm_advanced"}`. Logs appended to `logs/service.log` and PostgreSQL.
 
 ### Advanced Approach
 
-**Description:** A containerized, cloud-native deployment serving predictions at scale with ultra-low latency, integrated directly into the payment authorization gateway.
+**Description:** Containerized, cloud-native deployment on Kubernetes serving predictions with sub-50ms latency, integrated into the payment authorization gateway.
 
 **Responsibilities:**
-- Package the model artifact (ONNX format or compiled XGBoost) along with a lightweight serving runtime (FastAPI, KServe, or a custom C++ wrapper) in a Docker image.
-- Use a model registry (MLflow) to pull the production model version; the serving container auto-updates on version promotion via a CI/CD pipeline (GitOps with ArgoCD).
-- Deploy on Kubernetes with horizontal pod autoscaling (HPA) to handle transaction volume spikes. Latency SLA guaranteed by gRPC or REST endpoints behind a load balancer.
-- Integrate with an online feature store: the model server calls the feature server (Redis/DynamoDB) to fetch precomputed velocity features using the card ID, combining them with the request payload before inference. Total feature retrieval + inference < 50 ms.
-- Expose a `/v1/model/predict` endpoint that conforms to a versioned API contract, returning the fraud score, binary decision, and SHAP values for explainability (precomputed or using FastTreeSHAP).
-- Implement canary deployments to gradually roll out new model versions, routing a small percentage of traffic to the canary and monitoring error rates and latency before full promotion.
-- Circuit breaking and automatic fallback to a rule-based system if the model service fails to respond within 100 ms.
+- Package ONNX model + FastAPI serving runtime in Docker image.
+- Pull production model version automatically from MLflow Model Registry via CI/CD (ArgoCD).
+- Deploy on Kubernetes with horizontal pod autoscaling (target CPU 70%, min 2 pods, max 50).
+- Integrate online feature store: fetch precomputed velocity features from Redis using card ID (<10 ms), combine with request payload, run inference (<40 ms).
+- Expose `/v1/model/predict` with versioned API contract; return fraud score, binary decision, and SHAP explanations for regulatory compliance.
+- Canary deployments: 5% → 25% → 100% traffic, monitor error rate and latency at each stage.
+- Circuit breaker: if model service p99 latency exceeds 100ms, fallback to rule-based system.
 
-**Input:** Real-time transaction event from the payment gateway, containing raw transaction fields (`amount`, `mcc`, `terminal_type`, `timestamp`) and a card/user identifier.
+**Input:** Real-time transaction from payment gateway with card ID, Amount, MCC, terminal type, timestamp.
 
-**Output:** A structured response with `fraud_score` (0–1), `decision` (`APPROVE`/`DECLINE`/`REVIEW`), and `explanation` dict (top contributing feature names and Shapley values) for regulatory adverse action notices. Latency and response logged to a monitoring sink (Elasticsearch/Kafka).
+**Output:** `fraud_score` (0–1), `decision` (APPROVE/DECLINE/REVIEW), `explanation` (top 5 features with Shapley values). Latency logged to monitoring sink.
 
 ---
 
@@ -410,198 +526,154 @@ This document defines the complete architecture for an end-to-end machine learni
 
 ### Baseline Approach
 
-**Description:** A simple offline monitoring script that runs periodically on the laptop. It compares a recent batch of labeled transactions with the model's predictions to detect performance degradation.
+**Description:** An offline monitoring script that periodically loads a new batch of labeled transactions and compares model performance against the evaluation baseline.
+
+**🟢 UPDATE:** Now supports DB-sourced monitoring via `use_database=True` flag. Instead of loading CSV files and running inference, it queries `vw_transaction_results` for transactions with ground truth labels. Drift metrics are saved to `monitoring_metrics` table. Falls back to CSV-based monitoring when `use_database=False`.
 
 **Responsibilities:**
-- Load a CSV file of recent transactions with true fraud labels (simulating production feedback from `data/monitoring/new_transactions_labeled.csv`).
-- Run the model on those transactions and compute the same evaluation metrics as in Model Evaluation (PR-AUC, false positive rate).
-- Compare current metrics with baseline values from `reports/evaluation_report.json`.
-- Print a warning to console if the false positive rate increases by >20% relative or PR-AUC drops by >10%.
-- Save the report to disk as a timestamped log.
+- Load `data/monitoring/new_transactions_labeled.csv` (simulated production feedback with ground truth).
+- **NEW:** OR query `vw_transaction_results` from PostgreSQL (when `use_database=True`).
+- Run model inference and compute PR-AUC, false positive rate, recall.
+- Compare against baseline metrics from `reports/evaluation_report.json`.
+- Flag warning if false positive rate increases >20% relative or PR-AUC drops >10%.
+- Save timestamped monitoring report.
+- **NEW:** Save drift check results to `monitoring_metrics` table.
 
-**Input:** `data/monitoring/new_transactions_labeled.csv` (features + ground truth labels), `artifacts/model.pkl`, `reports/evaluation_report.json` (baseline metrics).
+**Input:** `data/monitoring/new_transactions_labeled.csv` (CSV mode) OR PostgreSQL `vw_transaction_results` (DB mode), `artifacts/model.pkl`, `reports/evaluation_report.json`.
 
-**Output:** A timestamped `reports/monitoring_report_YYYYMMDD.json` with current metrics, baseline metrics, and drift flags (`fpr_drift_warning: true/false`).
+**Output:** `reports/monitoring_report_YYYYMMDD.json` with current metrics, baseline metrics, drift flags. Database: `monitoring_metrics` table updated.
 
 ### Advanced Approach
 
-**Description:** A fully automated, continuous monitoring system that tracks data drift, concept drift, and model performance in production, triggering retraining pipelines autonomously when degradation is detected.
+**Description:** Fully automated continuous monitoring tracking data drift, concept drift, and model performance. Triggers automatic retraining when degradation is detected.
 
 **Responsibilities:**
-- Log all production predictions and outcomes (once fraud labels arrive) in a centralized monitoring database (e.g., Elasticsearch, ClickHouse). Include prediction timestamp, model version, feature values, score, and ground truth after the reporting delay period.
-- Use Evidently AI or Alibi Detect to run scheduled jobs that compute:
-  - **Data drift:** Population Stability Index (PSI) and Kolmogorov-Smirnov statistics for each feature between the training distribution and a recent window of production data.
-  - **Prediction drift:** Distribution of predicted scores over time.
-  - **Performance monitoring:** Once ground truth is available, compute rolling daily PR-AUC and false positive rate.
-- Define alert rules: if PSI > 0.2 for any key feature, or daily PR-AUC drops below the threshold, send an alert to the fraud ops Slack channel and open an incident ticket.
-- Implement an automated retraining trigger: if the model's false positive rate exceeds the business SLA for 3 consecutive days, a CI/CD pipeline kicks off a new training run using fresh labeled data and the latest feature definitions.
-- Maintain a dashboard (Grafana) to visualize real-time and historical metrics: transaction volume, average fraud score, approval/decline rates, latency percentiles (p50, p95, p99).
-- Use model registry capabilities to track which model version is in production and correlate with metrics; rollback automatically if the new model significantly degrades a key metric.
+- Log all predictions and delayed ground truth (chargeback data) to ClickHouse/Elasticsearch.
+- Scheduled Evidently AI jobs computing: data drift (PSI/KS per feature vs training reference), prediction drift (score distribution shift), performance (rolling daily PR-AUC, FPR).
+- Alert rules: PSI > 0.2 on V17/V14/V12, daily PR-AUC below threshold → Slack + incident ticket.
+- Automated retraining: if FPR exceeds SLA for 3 consecutive days → CI/CD triggers full pipeline rerun.
+- Grafana dashboards: transaction volume, average fraud score, approval/decline/review rates, latency p50/p95/p99.
+- Model version tracking in registry with automatic rollback if new version degrades key metrics.
 
-**Input:** Streaming inference logs (Kafka/Kinesis), delayed ground truth data feed (from chargeback/dispute settlement system), and training reference statistics stored in MLflow.
+**Input:** Streaming inference logs, delayed ground truth feed, training reference statistics.
 
-**Output:** Real-time Grafana dashboards, alert notifications (Slack/PagerDuty), automated retraining pipeline triggers, and a model health report artifact (`healthy`/`warning`/`degraded`) stored alongside the model version in the registry.
+**Output:** Real-time dashboards, alert notifications, automated retraining triggers, model health report (healthy/warning/degraded) in registry.
 
 ---
 
-### 5. Technology Stack Comparison
+### 5. Data Contract (Schema)
 
-| Component | Baseline | Advanced |
+| Feature | Type | Description |
 |---|---|---|
-| Language | Python 3.9+ | Python 3.10+ / Java (Flink) |
-| Data Manipulation | Pandas 1.5+ | Apache Spark 3.x, Dask |
-| Validation | Pandera 0.16+ | Great Expectations 0.18+ |
-| Visualization | Matplotlib, Seaborn | Sweetviz, Evidently AI, Grafana |
-| ML Framework | Scikit-learn 1.3+ | XGBoost, LightGBM, PyTorch/TensorFlow |
-| Imbalance Handling | SMOTE (imbalanced-learn) | SMOTE + scale_pos_weight + downsampling |
-| Experiment Tracking | Manual (JSON logs) | MLflow 2.x |
-| Hyperparameter Tuning | Manual 3-fold CV | Optuna / Hyperopt on Kubernetes |
-| Model Serialization | Joblib (`.pkl`) | ONNX, Treelite, native XGBoost |
-| Model Registry | None (local files) | MLflow Model Registry |
-| Feature Store | None (in-script computation) | Feast / Tecton |
-| Orchestration | Manual scripts | Airflow 2.x / Kubeflow Pipelines |
-| Serving | Flask dev server | FastAPI on Kubernetes (KServe) |
-| Online Store | N/A | Redis / DynamoDB |
-| Message Queue | N/A | Apache Kafka / AWS Kinesis |
-| Monitoring DB | N/A | Elasticsearch / ClickHouse |
-| CI/CD | None | GitHub Actions + ArgoCD |
-| Infrastructure | Local laptop | AWS/GCP/Azure (EKS/GKE/AKS) |
+| `Time` | float64 | Seconds elapsed since first transaction (0–172,792). Dropped before training. |
+| `V1`–`V28` | float64 | PCA-transformed anonymized features (mean ≈ 0, std ≈ 1) |
+| `Amount` | float64 | Transaction amount ($0.00–$25,691.16, median $22.00) |
+| `Amount_log` | float64 | Natural log of `Amount + 1` (reduces right-skew) |
+| `hour` | int64 | Hour extracted from `Time` (0–47 over ~48 hours) |
+| `hour_sin` | float64 | Cyclical sine encoding: `sin(2π × hour / 24)` |
+| `hour_cos` | float64 | Cyclical cosine encoding: `cos(2π × hour / 24)` |
+| `txn_count_1h` | int64 | Global transaction count in prior 3,600 seconds |
+| `txn_count_24h` | int64 | Global transaction count in prior 86,400 seconds |
+| `avg_amount_1h` | float64 | Mean transaction amount in prior 3,600 seconds |
+| `avg_amount_24h` | float64 | Mean transaction amount in prior 86,400 seconds |
+| `std_amount_1h` | float64 | Standard deviation of amounts in prior 3,600 seconds |
+| `Class` | int64 | Target: 1 = fraud (492 cases, 0.17%), 0 = legitimate |
 
 ---
 
 ### 6. Directory Structure
 
 ```
-fraud-detection/
+fraud-detection-real-time/
 ├── config/
-│   ├── pipeline_config.yaml            # Baseline: paths and parameters
-│   └── training_config.yaml            # Advanced: hyperparameter search space
+│   ├── pipeline_config.yaml
+│   └── split_config.txt
 ├── data/
 │   ├── raw/
-│   │   └── creditcard.csv              # Original dataset (gitignored)
+│   │   └── creditcard.csv              # 284,807 rows × 31 columns
 │   ├── processed/
 │   │   ├── cleaned.parquet
-│   │   ├── features.parquet
-│   │   ├── train.parquet
-│   │   └── test.parquet
-│   └── monitoring/
-│       └── new_transactions_labeled.csv
+│   │   ├── features_advanced.parquet
+│   │   ├── features_baseline.parquet
+│   │   ├── train_advanced.parquet
+│   │   ├── train_baseline.parquet
+│   │   ├── test_advanced.parquet
+│   │   └── test_baseline.parquet
+│   ├── monitoring/
+│   │   └── new_transactions_labeled.csv
+│   └── data_logging/
+│       ├── eda_results/
+│       └── validation_results/
 ├── artifacts/
-│   ├── scaler.pkl
-│   ├── feature_config.json
-│   ├── model.pkl
-│   ├── model_metadata.json
-│   └── model.onnx                      # Advanced deployment artifact
+│   ├── evaluation/                     # Test metrics JSONs
+│   ├── metrics/                        # Training CV metrics
+│   ├── plots/                          # Comparison plots
+│   ├── feature_config_advanced.json
+│   ├── feature_config_baseline.json
+│   └── scaler.pkl
+├── models/                             # 11 trained models + evaluation JSONs
 ├── reports/
-│   ├── validation_report.json
 │   ├── eda/
-│   │   ├── class_distribution.png
-│   │   ├── correlation_heatmap.png
-│   │   └── fraud_by_hour.png
-│   ├── evaluation_report.json
-│   ├── confusion_matrix.csv
-│   └── monitoring_report_YYYYMMDD.json
+│   ├── validation_report.json
+│   └── monitoring_report_*.json
 ├── logs/
 │   └── service.log
 ├── src/
-│   ├── ingest.py
+│   ├── database/                       # 🆕 PostgreSQL integration
+│   │   ├── connection.py               # SQLAlchemy engine + session
+│   │   ├── schema.sql                  # 5 tables, 4 views, 2 functions
+│   │   └── __init__.py
+│   ├── models/
+│   │   ├── train_baseline.py
+│   │   ├── train_advanced.py
+│   │   └── train_ssl.py
+│   ├── evaluation/
+│   │   ├── evaluate.py                 # 🆕 Logs to monitoring_metrics
+│   │   ├── visualize.py
+│   │   └── __init__.py
+│   ├── ingest.py                       # 🆕 Bulk load to PostgreSQL
 │   ├── validate.py
 │   ├── preprocess.py
 │   ├── eda.py
 │   ├── feature_engineering.py
 │   ├── split.py
-│   ├── train.py
-│   ├── evaluate.py
-│   ├── serve.py
-│   └── monitor.py
+│   ├── serve.py                        # 🆕 Logs predictions to DB
+│   ├── monitor.py                      # 🆕 DB-sourced drift detection
+│   └── data_validation_eda_pipeline.py
 ├── notebooks/
-│   └── eda_interactive.ipynb
-├── docker/
-│   ├── Dockerfile.train                 # Advanced: training container
-│   └── Dockerfile.serve                 # Advanced: serving container
-├── k8s/
-│   ├── deployment.yaml                  # Advanced: K8s deployment manifest
-│   └── hpa.yaml                         # Advanced: horizontal pod autoscaler
-├── requirements.txt
+├── DATABASE_GUIDE.md                   # 🆕 Daily workflow reference
 ├── ARCHITECTURE.md
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 ---
 
-### 7. Data Contract (Schema)
+### 7. Execution Flow (Baseline)
 
-The following schema is the contract between Feature Engineering and all downstream stages (Splitting, Training, Evaluation, Deployment, Monitoring).
+```powershell
+# Data Pipeline
+python -m src.ingest          # Load CSV → PostgreSQL (284,807 rows)
+python src/validate.py        # Schema check, nulls, duplicates
+python src/preprocess.py      # Scale Amount & Time, save scaler
+python src/eda.py             # Generate plots and statistics
+python src/feature_engineering.py  # Velocity features, cyclical time
+python src/split.py           # 80/20 time-aware split
 
-| Feature | Type | Description |
-|---|---|---|
-| `Time` | float64 | Seconds elapsed since first transaction (dropped before training) |
-| `V1` – `V28` | float64 | PCA-transformed anonymized features (already scaled) |
-| `Amount` | float64 | Transaction amount in local currency |
-| `Amount_log` | float64 | Natural log of `Amount + 1` |
-| `hour` | int64 | Hour of transaction extracted from `Time` (0–23) |
-| `day` | int64 | Day index relative to first transaction |
-| `hour_sin` | float64 | Cyclical sine encoding of hour: `sin(2π × hour / 24)` |
-| `hour_cos` | float64 | Cyclical cosine encoding of hour: `cos(2π × hour / 24)` |
-| `txn_count_1h` | int64 | Global transaction count in prior 3,600 seconds |
-| `txn_count_24h` | int64 | Global transaction count in prior 86,400 seconds |
-| `avg_amount_1h` | float64 | Mean transaction amount in prior 3,600 seconds |
-| `avg_amount_24h` | float64 | Mean transaction amount in prior 86,400 seconds |
-| `Class` | int64 | Target label: 1 = fraudulent, 0 = legitimate |
+# Model Training
+python src/models/train_baseline.py    # LR, DT, RF with SMOTE + 3-fold CV
+python src/models/train_advanced.py    # XGBoost, LightGBM, MLP
+
+# Evaluation
+python -m src.evaluation.evaluate --model models/lightgbm_advanced.pkl
+
+# Deployment
+python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
+
+# Monitoring (DB mode)
+python -c "from pathlib import Path; from src.monitor import MonitoringConfig, run_monitoring; config = MonitoringConfig(new_data_path=Path('data/monitoring/new_transactions_labeled.csv'), model_path=Path('models/lightgbm_advanced.pkl'), baseline_report_path=Path('models/lightgbm_advanced_evaluation.json'), output_dir=Path('reports'), use_database=True); result = run_monitoring(config); print(f'Action required: {result[\"action_required\"]}')"
+```
 
 ---
 
-### 8. Execution Flow
-
-**Baseline — Sequential Manual Execution:**
-
-```powershell
-python src/ingest.py
-python src/validate.py
-python src/preprocess.py
-python src/eda.py
-python src/feature_engineering.py
-python src/split.py
-python src/train.py
-python src/evaluate.py
-```
-
-Start the local prediction service:
-```powershell
-python src/serve.py
-```
-
-Test the endpoint:
-```powershell
-curl -X POST http://localhost:5000/predict -H "Content-Type: application/json" -d '{"Time": 150000, "V1": -1.5, "V28": 0.3, "Amount": 120.0}'
-```
-
-Run periodic offline monitoring:
-```powershell
-python src/monitor.py
-```
-
-**Advanced — Automated DAG Triggers:**
-- `data_ingestion_dag`: Runs hourly, ingests from Kafka/S3.
-- `validation_trigger`: Fires on new data landing in raw zone.
-- `training_dag`: Triggered by schedule (weekly) or monitoring alert.
-- `evaluation_dag`: Runs after training, gates promotion.
-- `deployment_pipeline`: CI/CD on model registry stage change.
-
----
-
-### 9. Production Scaling Path
-
-Each Baseline component maps directly to its Advanced counterpart with identical interface contracts.
-
-| Baseline Component | Production Replacement |
-|---|---|
-| CSV file read via Pandas | Kafka consumer + S3 batch reads via Spark |
-| Pandera assertions in script | Great Expectations suite in Airflow DAG |
-| Pandas `.fillna()` and `StandardScaler` | Spark ML Pipeline / serverless preprocessing container |
-| Jupyter notebook EDA | Automated Sweetviz/Evidently scheduled reports |
-| Pandas `.rolling()` velocity features | Flink/Spark Streaming windowed aggregations in Feast |
-| Scikit-learn Random Forest CV | XGBoost/LightGBM with Optuna on GPU-enabled Kubernetes |
-| Joblib serialization to `.pkl` | ONNX format + MLflow Model Registry |
-| Flask localhost dev server | FastAPI Docker container on K8s with online feature store fetch |
-| Offline monitor script | Evidently AI + Grafana dashboards + automated retraining triggers |
+*Last updated: 2026-05-09 — PostgreSQL 18 integration complete. 284,808 rows in database. serve.py, monitor.py, evaluate.py, and ingest.py all integrated with PostgreSQL. See Section 4 for remaining tasks.*
