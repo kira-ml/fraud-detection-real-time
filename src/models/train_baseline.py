@@ -86,32 +86,32 @@ def get_baseline_models(random_state: int = RANDOM_STATE) -> Dict[str, Any]:
     models = {
         "logistic_regression": LogisticRegression(
             max_iter=5000,
-            solver='lbfgs',          # Same results, 20-30x faster
+            solver='lbfgs',
             class_weight="balanced",
             random_state=random_state,
-            n_jobs=-1,
+            n_jobs=4,
             C=0.1,
         ),
         "decision_tree": DecisionTreeClassifier(
-            max_depth=8,  # FIX: Reduced from 10 to prevent overfitting
-            min_samples_split=100,  # FIX: Increased from 50
-            min_samples_leaf=50,  # FIX: Increased from 20
+            max_depth=8,
+            min_samples_split=100,
+            min_samples_leaf=50,
             class_weight="balanced",
             random_state=random_state,
         ),
         "naive_bayes": GaussianNB(
-            var_smoothing=1e-8,  # FIX: Adjusted smoothing
-            priors=None,  # Let sklearn compute priors from training data
+            var_smoothing=1e-8,
+            priors=None,
         ),
         "random_forest": RandomForestClassifier(
-            n_estimators=200,  # FIX: Increased from 100
-            max_depth=12,  # FIX: Reduced from 15 to prevent overfitting
-            min_samples_split=100,  # FIX: Increased from 50
-            min_samples_leaf=50,  # FIX: Increased from 20
-            max_features='sqrt',  # FIX: Limit features per tree
-            class_weight="balanced_subsample",  # FIX: Better for imbalanced data
+            n_estimators=200,
+            max_depth=12,
+            min_samples_split=100,
+            min_samples_leaf=50,
+            max_features='sqrt',
+            class_weight="balanced_subsample",
             random_state=random_state,
-            n_jobs=-1,
+            n_jobs=4,
             bootstrap=True,
         ),
     }

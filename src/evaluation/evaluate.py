@@ -1,7 +1,8 @@
 """
 Model Evaluation Script
 Evaluates trained baseline AND advanced models on their respective test sets.
-Supports single model evaluation, multi-model comparison, and cross-type comparison.
+Supports single model evaluation, multi-model comparison, cross-type comparison,
+and threshold sweep analysis for operational decision-making.
 """
 import os
 import sys
@@ -221,6 +222,10 @@ def evaluate_model(
     # Calculate metrics
     metrics = calculate_metrics(y_test, y_pred, y_proba)
     
+    # Store probability arrays for threshold sweep
+    metrics["y_proba"] = y_proba
+    metrics["y_true"] = y_test
+    
     # Add timing and type info
     metrics["inference_time_seconds"] = round(inference_time, 4)
     metrics["inference_time_ms_per_sample"] = round((inference_time / len(y_test)) * 1000, 2)
@@ -248,6 +253,193 @@ def evaluate_model(
     
     return metrics
 
+
+# ================================
+# Threshold Sweep Analysis (NEW)
+# ================================
+
+def run_threshold_sweep(
+    all_results: Dict[str, Dict],
+    output_dir: str,
+) -> Dict[str, Any]:
+    """
+    Sweep decision thresholds for LightGBM and Logistic Regression to find
+    optimal operating points for different business scenarios.
+    
+    Compares the precision-recall tradeoff at configurable thresholds and
+    calculates the business cost for each operating point.
+    
+    Args:
+        all_results: Dictionary of model evaluation results (must contain
+                     'y_proba' and 'y_true' arrays for each model).
+        output_dir: Directory to save threshold analysis JSON.
+    
+    Returns:
+        Dictionary with threshold sweep results for each model analyzed.
+    """
+    print("\n" + "=" * 70)
+    print("THRESHOLD SWEEP ANALYSIS")
+    print("=" * 70)
+    
+    # Focus on the two most operationally interesting models
+    target_models = ["lightgbm_advanced", "logistic_regression_baseline"]
+    
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    
+    # Assumptions for business cost calculation
+    avg_fraud_loss = 500.0       # Average loss per missed fraud ($)
+    avg_churn_cost = 300.0       # Customer lifetime value loss per false decline ($)
+    
+    sweep_results = {}
+    
+    # Pre-define multi-line headers outside f-strings
+    hdr_fraud_caught = "Fraud\nCaught"
+    hdr_false_alarms = "False\nAlarms"
+    hdr_business_cost = "Business\nCost"
+    
+    for model_name in target_models:
+        if model_name not in all_results:
+            print(f"[THRESHOLD] Model '{model_name}' not found in results. Skipping.")
+            continue
+        
+        model_data = all_results[model_name]
+        y_proba = model_data.get("y_proba")
+        y_true = model_data.get("y_true")
+        
+        if y_proba is None or y_true is None:
+            print(f"[THRESHOLD] No probability data for {model_name}. Skipping.")
+            continue
+        
+        display_name = model_name.replace("_baseline", "").replace("_advanced", "")
+        total_fraud = int(y_true.sum())
+        total_legit = int(len(y_true) - total_fraud)
+        
+        print(f"\n[THRESHOLD] Model: {display_name}")
+        print(f"[THRESHOLD] Total transactions: {len(y_true):,}")
+        print(f"[THRESHOLD] Fraud cases: {total_fraud}")
+        print(f"[THRESHOLD] Legitimate transactions: {total_legit:,}")
+        print(f"\n[THRESHOLD] {'Threshold':>10s} {'Recall':>8s} {'Precision':>10s} "
+              f"{'FPR':>8s} {hdr_fraud_caught:>8s} {hdr_false_alarms:>10s} {'F1':>8s} "
+              f"{hdr_business_cost:>12s}")
+        print(f"[THRESHOLD] {'-' * 75}")
+        
+        model_thresholds = []
+        
+        for t in thresholds:
+            y_pred = (y_proba >= t).astype(int)
+            
+            cm = confusion_matrix(y_true, y_pred)
+            tn, fp, fn, tp = cm.ravel()
+            
+            recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
+            precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+            f1 = 2 * precision_val * recall_val / (precision_val + recall_val) if (precision_val + recall_val) > 0 else 0
+            
+            # Business cost: missed fraud cost + churn cost from false declines
+            business_cost = (fn * avg_fraud_loss) + (fp * avg_churn_cost)
+            
+            result = {
+                "threshold": float(t),
+                "recall": round(float(recall_val), 4),
+                "precision": round(float(precision_val), 4),
+                "fpr": round(float(fpr), 4),
+                "f1_score": round(float(f1), 4),
+                "fraud_caught": int(tp),
+                "fraud_missed": int(fn),
+                "false_alarms": int(fp),
+                "true_negatives": int(tn),
+                "business_cost": round(float(business_cost), 2),
+            }
+            model_thresholds.append(result)
+            
+            # Highlight recommended thresholds
+            marker = ""
+            if t == 0.3:
+                marker = " <- Fraud wave response"
+            elif t == 0.5:
+                marker = " <- Balanced (default)"
+            elif t == 0.7:
+                marker = " <- Customer experience priority"
+            
+            print(f"[THRESHOLD] {t:>10.1f} {recall_val:>8.4f} {precision_val:>10.4f} "
+                  f"{fpr:>8.4f} {tp:>5}/{total_fraud:>3} {fp:>10,} {f1:>8.4f} "
+                  f"${business_cost:>10,.0f}{marker}")
+        
+        # Find best threshold by F1 score
+        best_f1 = max(model_thresholds, key=lambda x: x["f1_score"])
+        print(f"\n[THRESHOLD] Best F1 threshold: {best_f1['threshold']:.1f} "
+              f"(F1={best_f1['f1_score']:.4f}, Recall={best_f1['recall']:.4f}, "
+              f"Precision={best_f1['precision']:.4f})")
+        
+        # Find best threshold by business cost
+        best_cost = min(model_thresholds, key=lambda x: x["business_cost"])
+        print(f"[THRESHOLD] Lowest business cost: {best_cost['threshold']:.1f} "
+              f"(${best_cost['business_cost']:,.0f}, Fraud caught: {best_cost['fraud_caught']}/{total_fraud}, "
+              f"False alarms: {best_cost['false_alarms']:,})")
+        
+        sweep_results[model_name] = {
+            "display_name": display_name,
+            "total_fraud": total_fraud,
+            "total_legitimate": total_legit,
+            "thresholds": model_thresholds,
+            "best_f1_threshold": best_f1["threshold"],
+            "best_cost_threshold": best_cost["threshold"],
+            "business_assumptions": {
+                "avg_fraud_loss": avg_fraud_loss,
+                "avg_churn_cost": avg_churn_cost,
+            },
+        }
+    
+    # Cross-model comparison at key thresholds
+    if len(sweep_results) >= 2:
+        print("\n" + "=" * 70)
+        print("CROSS-MODEL COMPARISON AT KEY THRESHOLDS")
+        print("=" * 70)
+        
+        hdr_fc2 = "Fraud\nCaught"
+        hdr_fa2 = "False\nAlarms"
+        
+        for t in [0.3, 0.5, 0.7]:
+            print(f"\n[THRESHOLD] --- Threshold = {t:.1f} ---")
+            print(f"[THRESHOLD] {'Model':30s} {'Recall':>8s} {'Precision':>10s} "
+                  f"{'FPR':>8s} {hdr_fc2:>8s} {hdr_fa2:>10s} {'Cost':>10s}")
+            print(f"[THRESHOLD] {'-' * 80}")
+            
+            for model_name, data in sweep_results.items():
+                thresh_data = next((th for th in data["thresholds"] if abs(th["threshold"] - t) < 0.01), None)
+                if thresh_data:
+                    print(f"[THRESHOLD] {data['display_name']:30s} "
+                          f"{thresh_data['recall']:>8.4f} {thresh_data['precision']:>10.4f} "
+                          f"{thresh_data['fpr']:>8.4f} "
+                          f"{thresh_data['fraud_caught']:>5}/{data['total_fraud']:<3} "
+                          f"{thresh_data['false_alarms']:>10,} "
+                          f"${thresh_data['business_cost']:>9,.0f}")
+    
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    sweep_path = os.path.join(output_dir, "threshold_sweep_analysis.json")
+    
+    # Strip numpy arrays before saving
+    def convert(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert(v) for v in obj]
+        return obj
+    
+    with open(sweep_path, "w") as f:
+        json.dump(convert(sweep_results), f, indent=2)
+    
+    print(f"\n[THRESHOLD] Threshold analysis saved to: {sweep_path}")
+    
+    return sweep_results
 
 # ================================
 # Model Comparison
@@ -352,10 +544,13 @@ def save_evaluation_results(
             return [convert(v) for v in obj]
         return obj
     
+    # Strip probability arrays before saving to JSON (too large)
+    results_to_save = {k: v for k, v in results.items() if k not in ("y_proba", "y_true")}
+    
     output_path = os.path.join(output_dir, f"{model_name}_test_metrics.json")
     
     with open(output_path, "w") as f:
-        json.dump(convert(results), f, indent=2)
+        json.dump(convert(results_to_save), f, indent=2)
     
     print(f"[EVALUATE] Results saved to: {output_path}")
     
@@ -422,6 +617,163 @@ def save_metrics_to_database(
         print(f"[EVALUATE] WARNING: Failed to save metrics to DB: {e}")
         return False
 
+
+
+# ================================
+# Missed Fraud Analysis (NEW)
+# ================================
+
+def analyze_missed_fraud(
+    all_results: Dict[str, Dict],
+    output_dir: str,
+) -> Optional[Dict]:
+    """
+    Profile the fraud cases that LightGBM missed.
+    Compares feature distributions between caught and missed fraud.
+    
+    Args:
+        all_results: Dictionary of model evaluation results (must contain
+                     'y_proba' and 'y_true' arrays for lightgbm_advanced).
+        output_dir: Directory to save analysis JSON.
+    
+    Returns:
+        Dictionary with missed fraud analysis, or None if data unavailable.
+    """
+    model_name = "lightgbm_advanced"
+    
+    if model_name not in all_results:
+        print("[MISSED-FRAUD] LightGBM results not found. Skipping.")
+        return None
+    
+    model_data = all_results[model_name]
+    y_proba = model_data.get("y_proba")
+    y_true = model_data.get("y_true")
+    
+    if y_proba is None or y_true is None:
+        print("[MISSED-FRAUD] No probability data available. Skipping.")
+        return None
+    
+    # Load test DataFrame to get feature values
+    test_path = PROJECT_ROOT / "data" / "processed" / "test_advanced.parquet"
+    if not test_path.exists():
+        print("[MISSED-FRAUD] Test data not found. Skipping.")
+        return None
+    
+    df_test = pd.read_parquet(test_path)
+    feature_cols = [col for col in df_test.columns if col != "Class"]
+    
+    # Get predictions at default threshold
+    y_pred = (y_proba >= 0.5).astype(int)
+    
+    # Split into missed fraud and caught fraud
+    fn_mask = (y_true == 1) & (y_pred == 0)
+    tp_mask = (y_true == 1) & (y_pred == 1)
+    
+    missed = df_test[fn_mask]
+    caught = df_test[tp_mask]
+    
+    n_missed = len(missed)
+    n_caught = len(caught)
+    total_fraud = n_missed + n_caught
+    
+    print("\n" + "=" * 70)
+    print("MISSED FRAUD ANALYSIS")
+    print("=" * 70)
+    print(f"[MISSED-FRAUD] Total fraud in test: {total_fraud}")
+    print(f"[MISSED-FRAUD] Caught: {n_caught} ({n_caught/total_fraud*100:.1f}%)")
+    print(f"[MISSED-FRAUD] Missed: {n_missed} ({n_missed/total_fraud*100:.1f}%)")
+    
+    # Features to compare
+    key_features = [
+        "Amount_raw", "fraud_direction_score", "fraud_feature_magnitude",
+        "V14", "V17", "V4", "V14_V10", "V16_V17",
+        "time_since_last_txn", "hour", "txn_count_10min", "V8"
+    ]
+    
+    # Keep only features that exist
+    available_features = [f for f in key_features if f in df_test.columns]
+    
+    # Add fraud probabilities to missed cases
+    missed_probas = y_proba[fn_mask]
+    caught_probas = y_proba[tp_mask]
+    
+    # Build comparison
+    comparison = {}
+    for feat in available_features:
+        comparison[feat] = {
+            "missed_mean": round(float(missed[feat].mean()), 4),
+            "caught_mean": round(float(caught[feat].mean()), 4),
+            "missed_median": round(float(missed[feat].median()), 4),
+            "caught_median": round(float(caught[feat].median()), 4),
+            "missed_std": round(float(missed[feat].std()), 4),
+            "caught_std": round(float(caught[feat].std()), 4),
+        }
+    
+    # Print comparison table
+    print(f"\n[MISSED-FRAUD] Feature Comparison: Missed vs Caught Fraud")
+    print(f"[MISSED-FRAUD] {'Feature':30s} {'Missed Mean':>12s} {'Caught Mean':>12s} {'Difference':>12s}")
+    print(f"[MISSED-FRAUD] {'-' * 70}")
+    
+    for feat in available_features:
+        m_mean = comparison[feat]["missed_mean"]
+        c_mean = comparison[feat]["caught_mean"]
+        diff = m_mean - c_mean
+        direction = "↑" if diff > 0 else "↓"
+        print(f"[MISSED-FRAUD] {feat:30s} {m_mean:>12.4f} {c_mean:>12.4f} {diff:>11.4f} {direction}")
+    
+    # Model confidence on missed cases
+    print(f"\n[MISSED-FRAUD] Model Confidence on Missed Fraud:")
+    print(f"[MISSED-FRAUD]   Mean probability: {missed_probas.mean():.4f}")
+    print(f"[MISSED-FRAUD]   Median probability: {np.median(missed_probas):.4f}")
+    print(f"[MISSED-FRAUD]   Min: {missed_probas.min():.4f}, Max: {missed_probas.max():.4f}")
+    
+    print(f"\n[MISSED-FRAUD] Model Confidence on Caught Fraud:")
+    print(f"[MISSED-FRAUD]   Mean probability: {caught_probas.mean():.4f}")
+    print(f"[MISSED-FRAUD]   Median probability: {np.median(caught_probas):.4f}")
+    
+    # Build output
+    analysis = {
+        "total_fraud": total_fraud,
+        "caught_count": n_caught,
+        "missed_count": n_missed,
+        "missed_probabilities": {
+            "mean": round(float(missed_probas.mean()), 4),
+            "median": round(float(np.median(missed_probas)), 4),
+            "min": round(float(missed_probas.min()), 4),
+            "max": round(float(missed_probas.max()), 4),
+        },
+        "caught_probabilities": {
+            "mean": round(float(caught_probas.mean()), 4),
+            "median": round(float(np.median(caught_probas)), 4),
+        },
+        "feature_comparison": comparison,
+        "interpretation": {
+            "likely_low_amount": comparison.get("Amount_raw", {}).get("missed_mean", 0) < comparison.get("Amount_raw", {}).get("caught_mean", 0),
+            "likely_low_direction_score": comparison.get("fraud_direction_score", {}).get("missed_mean", 0) < comparison.get("fraud_direction_score", {}).get("caught_mean", 0),
+        }
+    }
+    
+    # Save
+    os.makedirs(output_dir, exist_ok=True)
+    analysis_path = os.path.join(output_dir, "missed_fraud_analysis.json")
+    
+    def convert(obj):
+        if isinstance(obj, (np.integer,)): return int(obj)
+        elif isinstance(obj, (np.floating,)): return float(obj)
+        elif isinstance(obj, np.ndarray): return obj.tolist()
+        elif isinstance(obj, dict): return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list): return [convert(v) for v in obj]
+        return obj
+    
+    with open(analysis_path, "w") as f:
+        json.dump(convert(analysis), f, indent=2)
+    
+    print(f"\n[MISSED-FRAUD] Analysis saved to: {analysis_path}")
+    
+    return analysis
+
+
+
 # ================================
 # Main Evaluation Pipeline
 # ================================
@@ -434,6 +786,7 @@ def run_evaluation(
     output_dir: Optional[str] = None,
     evaluate_all: bool = True,
     model_type: Optional[str] = None,  # 'baseline', 'advanced', or None for both
+    run_threshold_analysis: bool = True,  # NEW: run threshold sweep
 ) -> Dict[str, Any]:
     """
     Execute the evaluation pipeline for baseline and/or advanced models.
@@ -446,6 +799,7 @@ def run_evaluation(
         output_dir: Directory to save results.
         evaluate_all: If True, evaluate all models found.
         model_type: 'baseline', 'advanced', or None for both.
+        run_threshold_analysis: If True, run threshold sweep after evaluation.
     
     Returns:
         Dictionary with evaluation results for all models.
@@ -550,6 +904,19 @@ def run_evaluation(
         if baseline_results and advanced_results:
             compare_models(all_results, "FULL MODEL COMPARISON — BASELINE vs ADVANCED (TEST SET)")
     
+    # ================================
+    # Threshold Sweep
+    # ================================
+    if run_threshold_analysis and len(all_results) >= 2:
+        sweep_results = run_threshold_sweep(all_results, output_dir)
+        all_results["_threshold_sweep"] = sweep_results
+
+    # ================================
+    # Missed Fraud Analysis
+    # ================================
+    if len(all_results) >= 1:
+        analyze_missed_fraud(all_results, output_dir)
+
     return all_results
 
 
@@ -607,6 +974,11 @@ def main():
         default=True,
         help="Evaluate all models in models-dir (default: True)",
     )
+    parser.add_argument(
+        "--no-threshold-sweep",
+        action="store_true",
+        help="Skip threshold sweep analysis",
+    )
     
     args = parser.parse_args()
     
@@ -619,6 +991,7 @@ def main():
             output_dir=args.output_dir,
             evaluate_all=args.all,
             model_type=args.type,
+            run_threshold_analysis=not args.no_threshold_sweep,
         )
         
         if results:

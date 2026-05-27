@@ -112,8 +112,8 @@ def get_advanced_models(
             "objective": "binary:logistic",
             "eval_metric": "aucpr",
             "random_state": random_state,
-            "n_jobs": -1,
-            "tree_method": "hist",  # Faster training
+            "n_jobs": 4,
+            "tree_method": "hist",
         }
         
         if scale_pos_weight_val:
@@ -122,24 +122,23 @@ def get_advanced_models(
         models["xgboost"] = xgb.XGBClassifier(**xgb_params)
     
     # LightGBM - Faster, often better on imbalanced data
-    # LightGBM - Faster, often better on imbalanced data
     if LIGHTGBM_AVAILABLE:
         lgb_params = {
-        "n_estimators": 500,
-        "max_depth": 5,
-        "num_leaves": 31,
-        "learning_rate": 0.03,
-        "subsample": 0.7,
-        "colsample_bytree": 0.7,
-        "min_child_samples": 100,
-        "reg_alpha": 0.5,
-        "reg_lambda": 1.0,
-        "objective": "binary",
-        "metric": "average_precision",
-        "boosting_type": "gbdt",
-        "random_state": random_state,
-        "n_jobs": -1,
-        "verbose": -1,
+            "n_estimators": 500,
+            "max_depth": 5,
+            "num_leaves": 31,
+            "learning_rate": 0.03,
+            "subsample": 0.7,
+            "colsample_bytree": 0.7,
+            "min_child_samples": 100,
+            "reg_alpha": 0.5,
+            "reg_lambda": 1.0,
+            "objective": "binary",
+            "metric": "average_precision",
+            "boosting_type": "gbdt",
+            "random_state": random_state,
+            "n_jobs": 4,
+            "verbose": -1,
         }
     
         models["lightgbm"] = lgb.LGBMClassifier(**lgb_params)

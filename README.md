@@ -9,6 +9,8 @@ A production-minded machine learning system for detecting fraudulent credit card
 **Prediction Type:** Binary classification with calibrated probability scoring  
 **Pipeline:** End-to-end — ingest → validate → preprocess → split → feature engineer → train → evaluate → deploy → monitor
 
+![Model Comparison Dashboard](artifacts/plots/01_pr_curves.png)
+
 ---
 
 ## Business Context
@@ -38,7 +40,7 @@ Rule-based systems ("block all foreign transactions over $500") suffer from rigi
 | **Prediction Frequency** | Per transaction, sub-millisecond |
 | **Latency Budget** | ≤ 100ms end-to-end |
 | **Primary Metric** | Precision-Recall AUC (chosen over accuracy due to 0.17% fraud rate) |
-| **Interpretability** | Feature importance rankings; SHAP explanations pending |
+| **Interpretability** | Feature importance rankings + SHAP explanations |
 
 ---
 
@@ -146,6 +148,8 @@ The orchestrator (`src/pipeline.py`) wires 9 modules in sequence, passing DataFr
 
 Seven models were trained and evaluated on an honest, leakage-free time split (80% train / 20% test, split by raw timestamp before feature engineering). All metrics reported on the held-out test set.
 
+**Baseline models** are trained on the 50-feature baseline set. **Advanced models** receive the baseline features plus 30 additional engineered features (80 total). The two tiers never cross — this is a clean comparison of whether the extra feature engineering adds value.
+
 ### Baseline Models (50 features)
 
 | Model | CV PR-AUC | Test PR-AUC | Test Recall | Test Precision | Test FPR |
@@ -160,16 +164,32 @@ Seven models were trained and evaluated on an honest, leakage-free time split (8
 | Model | CV PR-AUC | Test PR-AUC | Test Recall | Test Precision | Test FPR |
 |-------|-----------|-------------|-------------|----------------|----------|
 | **🏆 LightGBM** | **0.8579** | **0.7925** | 0.7629 | **0.7957** | **0.03%** |
-| XGBoost | 0.8414 | 0.7884 | 0.7629 | 0.6789 | 0.05% |
+| XGBoost | 0.8425 | 0.7833 | 0.7629 | 0.6727 | 0.05% |
 | MLP | 0.8131 | 0.7770 | 0.7629 | 0.7327 | 0.04% |
 
 ### Key Findings
 
-**Model selection:** LightGBM achieves the best balance, catching 74 of 97 fraud cases (76.3%) while incorrectly flagging only 19 of 73,337 legitimate transactions — a false positive rate of 0.03%. For context, a typical rule-based system operating at 70% recall would generate approximately 3,500 false positives on the same volume, 185× more than LightGBM.
+**Model selection — LightGBM wins on operational cost, not just metrics.** LightGBM catches 74 of 97 fraud cases (76.3%) while incorrectly flagging only 19 of 73,337 legitimate transactions — a false positive rate of 0.03%. For context, a typical rule-based system at 70% recall would generate approximately 3,500 false positives on the same volume, 185× more than LightGBM.
 
-**Feature engineering impact:** The engineered features consistently rank among the most important predictors. `fraud_direction_score` (encoding domain knowledge that V17/V14/V12/V10/V16 are negatively correlated with fraud) is LightGBM's top feature. `fraud_feature_magnitude` is XGBoost's top feature at 32.4% importance. Temporal features (`hour_sin`, `day`) and velocity features (`time_since_last_txn`, `txn_count_10min`) appear in the top 15 for both gradient boosting models, confirming they carry signal now that they are computed from raw seconds rather than scaled values.
+**The real story is the business cost.** Logistic Regression catches more fraud (86/97, 88.7%) but generates 1,096 false alarms — a 1.49% false positive rate. In a system processing 100,000 transactions daily, that's 1,490 annoyed customers calling their bank. LightGBM's 0.03% FPR produces only 30 false flags per day. Assuming $500 average fraud loss and $300 customer churn cost per false decline:
 
-**Baseline vs. advanced trade-off:** Random Forest on 50 baseline features achieves a test PR-AUC of 0.7946 — only 0.002 below LightGBM on 80 features. For deployment scenarios where model simplicity or faster retraining matters, the baseline RF offers a strong alternative with 80% fewer features.
+| Model | Fraud Caught | False Alarms | Business Cost |
+|-------|-------------|-------------|---------------|
+| Logistic Regression (default threshold) | 86/97 | 1,096 | $334,300 |
+| LightGBM (default threshold) | 74/97 | 19 | **$17,200** |
+| LightGBM (threshold 0.7) | 73/97 | 13 | **$15,900** |
+
+**LightGBM reduces operational cost by ~95% compared to the high-recall baseline**, even though it catches fewer fraud cases. Trading 12-13 missed frauds for over 1,000 fewer false alarms is the correct business decision at scale.
+
+**Feature engineering impact — engineered features dominate raw PCA.** `fraud_direction_score` (encoding domain knowledge that V17/V14/V12/V10/V16 are negatively correlated with fraud) is LightGBM's #1 feature. `fraud_feature_magnitude` is XGBoost's top feature at 28.9% importance. The top 5 LightGBM features are all either engineered interaction terms or domain-driven scores — none are raw PCA components. Temporal features (`hour_sin`, `time_since_last_txn`) and velocity features (`txn_count_10min`, `std_amount_24h`) appear in the top 15, confirming they carry signal when computed from raw seconds rather than scaled values.
+
+![Feature Importance](artifacts/plots/03_feature_importance.png)
+
+**SHAP analysis reveals feature direction, not just importance.** High values of `V14_V10` strongly push predictions toward fraud, likely capturing a specific attack vector. `fraud_direction_score` shows a clean linear relationship — acting as a maliciousness score. High `V8` pushes predictions away from fraud, suggesting it captures normal high-value transaction patterns and acts as a whitelisting signal.
+
+![SHAP Summary](artifacts/plots/05_shap_summary.png)
+
+**Baseline vs. advanced trade-off:** Random Forest on 50 baseline features achieves a test PR-AUC of 0.7946 — only 0.002 above LightGBM on 80 features. However, RF generates 112 false alarms (0.15% FPR) compared to LightGBM's 19 (0.03% FPR). The advanced feature set doesn't dramatically improve recall — it dramatically improves precision. For deployment scenarios where model simplicity matters, RF offers a strong alternative; where operational cost dominates, LightGBM is the clear winner.
 
 **Naive Bayes and Decision Tree** are included as lower bounds. Naive Bayes fails (PR-AUC < 0.10) regardless of feature set — expected given the strong feature dependencies in this domain.
 
@@ -180,7 +200,52 @@ Seven models were trained and evaluated on an honest, leakage-free time split (8
 | Fraud Caught | 74/97 (76.3%) | Detects ~3 of 4 fraud attempts |
 | False Positives | 19/73,337 (0.03%) | 1 in 3,860 legitimate transactions flagged |
 | Precision | 79.6% | Nearly 4 of 5 flagged transactions are genuine fraud |
+| Business Cost (default) | $17,200 | vs $334,300 for high-recall baseline |
 | Inference Time | <1ms per transaction | Well within 50ms SLA |
+
+---
+
+## Error Analysis: Why 23 Fraud Cases Go Undetected
+
+All three advanced models (LightGBM, XGBoost, MLP) miss exactly the same 23 fraud cases — a hard recall ceiling at 76.3%. Investigating these cases reveals they share a distinct profile:
+
+| Feature | Missed Fraud (mean) | Caught Fraud (mean) | Interpretation |
+|---------|--------------------|--------------------|----------------|
+| `fraud_direction_score` | 2.57 | 4.84 | Missed fraud triggers only 2-3 of 5 fraud signals |
+| `fraud_feature_magnitude` | 6.08 | 24.20 | 4× weaker overall fraud signal intensity |
+| `V14_V10` | 0.78 | 33.62 | The #1 SHAP feature is 43× lower |
+| `V14` | -1.57 | -7.76 | Missed fraud lacks the strong negative V14 signal |
+| `V17` | +0.80 | -3.93 | Missed fraud has *positive* V17 (caught fraud is strongly negative) |
+
+**Model confidence confirms the pattern:** the 23 missed cases have a mean predicted fraud probability of **4.7%** (median 1.1%), while caught fraud has a mean of **98.8%** (median 99.9%). The model isn't uncertain about these cases — it's confident they're legitimate.
+
+**Conclusion:** This is a data ceiling, not a model problem. The 23 missed fraud cases don't express the PCA patterns the model learned to associate with fraud. Without card-level behavioral history, merchant category codes, or device fingerprints, a subset of fraud will always resemble normal spending in an anonymized feature space. Closing this gap would require features unavailable in this dataset.
+
+---
+
+## Threshold Tuning: Choosing an Operating Point
+
+The decision threshold is configurable — different business scenarios demand different tradeoffs. Measured results from a full threshold sweep (0.1–0.9):
+
+### LightGBM
+
+| Threshold | Recall | Precision | FPR | Fraud Caught | False Alarms | Business Cost | Use Case |
+|-----------|--------|-----------|-----|-------------|-------------|---------------|----------|
+| 0.3 | 77.3% | 70.1% | 0.04% | 75/97 | 32 | $20,600 | Fraud wave response |
+| 0.5 | 76.3% | 79.6% | 0.03% | 74/97 | 19 | $17,200 | Balanced operations (default) |
+| 0.7 | 75.3% | 84.9% | 0.02% | 73/97 | 13 | $15,900 | Customer experience priority |
+
+### Logistic Regression (high-recall alternative)
+
+| Threshold | Recall | Precision | FPR | Fraud Caught | False Alarms | Business Cost |
+|-----------|--------|-----------|-----|-------------|-------------|---------------|
+| 0.3 | 90.7% | 3.9% | 2.93% | 88/97 | 2,150 | $649,500 |
+| 0.5 | 88.7% | 7.3% | 1.49% | 86/97 | 1,096 | $334,300 |
+| 0.7 | 84.5% | 13.9% | 0.69% | 82/97 | 508 | $159,900 |
+
+Even at the most conservative threshold (0.9), Logistic Regression generates 174 false alarms compared to LightGBM's 4. The advanced feature set doesn't just improve recall — it fundamentally changes the precision-recall tradeoff in a way that makes the model operationally viable at scale.
+
+![Threshold Tradeoff](artifacts/plots/04_threshold_tradeoff.png)
 
 ---
 
@@ -210,16 +275,6 @@ curl -X POST http://localhost:5000/predict \
   "model": "lightgbm_advanced"
 }
 ```
-
-### Threshold Tuning
-
-The decision threshold is configurable via `FRAUD_THRESHOLD` environment variable:
-
-| Threshold | Expected Recall | Expected FPR | Use Case |
-|-----------|----------------|--------------|----------|
-| 0.3 | ~85% | ~0.08% | Fraud wave response |
-| 0.5 (default) | 76.3% | 0.03% | Balanced operations |
-| 0.7 | ~68% | ~0.01% | Customer experience priority |
 
 ---
 
@@ -252,6 +307,18 @@ A PostgreSQL 18 database (`fraud_detection`) provides an audit trail and monitor
 
 ---
 
+## What I Would Do With Real Data
+
+This dataset uses PCA-anonymized features with no card or merchant identifiers — a common limitation of public fraud detection benchmarks. With access to real payment network data, I would add:
+
+- **Card-level velocity features:** Per-card transaction frequency, amount deviation from cardholder baseline, geographic velocity between transactions
+- **Merchant risk signals:** Category codes (MCC), merchant fraud history, time since merchant's first transaction in the network
+- **Network graph features:** Shared attributes between transactions (device fingerprints, IP prefixes, BIN ranges) to detect coordinated fraud rings and synthetic identity patterns
+- **Streaming architecture:** Replace batch pipeline with Kafka/Flink for true sub-100ms feature computation on sliding windows, enabling real-time velocity features at authorization time
+- **Feedback loop:** Integrate chargeback data as ground truth labels to automatically retrain on confirmed fraud patterns
+
+---
+
 ## Constraints & Current Status
 
 | Requirement | Specification | Status |
@@ -262,7 +329,9 @@ A PostgreSQL 18 database (`fraud_detection`) provides an audit trail and monitor
 | Auto Model Selection | Best model by PR-AUC at startup | ✅ |
 | Drift Monitoring | FPR + PR-AUC vs baseline | ✅ |
 | Database Audit Trail | PostgreSQL prediction + transaction logging | ✅ |
-| Model Interpretability | SHAP explanations for adverse action notices | ⚠️ Pending |
+| Model Interpretability | SHAP explanations | ✅ |
+| Error Analysis | Missed fraud profiling | ✅ |
+| Threshold Tuning | Measured sweep with business cost | ✅ |
 
 ---
 
@@ -281,6 +350,9 @@ python src/pipeline.py --mode full
 # Quick test
 python src/pipeline.py --mode baseline --dry-run
 
+# Generate visualizations
+python src/evaluation/visualize.py
+
 # Start API
 python -c "from src.serve import get_app; app = get_app(); app.run(host='localhost', port=5000)"
 ```
@@ -289,7 +361,7 @@ python -c "from src.serve import get_app; app = get_app(); app.run(host='localho
 
 ## Dependencies
 
-Python 3.8+ · scikit-learn · XGBoost · LightGBM · imbalanced-learn · pandas · NumPy · Flask · PyTorch · PostgreSQL (SQLAlchemy) · joblib · PyYAML
+Python 3.8+ · scikit-learn · XGBoost · LightGBM · imbalanced-learn · pandas · NumPy · Flask · PyTorch · SHAP · PostgreSQL (SQLAlchemy) · joblib · PyYAML
 
 ---
 
@@ -299,4 +371,4 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-*Last updated: 2026-05-27 — Full pipeline validated with leakage-free temporal split. LightGBM deployed at 0.7925 test PR-AUC, 79.6% precision, 0.03% FPR on 73,434 held-out transactions across ~10 hours of unseen data.*
+*Last updated: 2026-05-28 — Full pipeline validated with leakage-free temporal split. LightGBM deployed at 0.7925 test PR-AUC, 79.6% precision, 0.03% FPR. Threshold sweep, SHAP analysis, and missed fraud profiling complete. Business cost analysis confirms LightGBM reduces operational loss by ~95% compared to high-recall baseline.*
