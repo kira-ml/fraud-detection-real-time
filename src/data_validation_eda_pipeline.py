@@ -868,6 +868,7 @@ class ReportGenerator:
     """Generate comprehensive data validation and EDA reports"""
     
     def __init__(self, config: Config, logger: logging.Logger, output_dir: Path):
+        
         self.config = config
         self.logger = logger
         self.output_dir = output_dir

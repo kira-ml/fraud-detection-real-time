@@ -181,7 +181,9 @@ def scale_features(X: np.ndarray) -> Tuple[np.ndarray, StandardScaler]:
 def create_smote_pipeline(
     model: Any, 
     use_scaler: bool = False,
-    random_state: int = RANDOM_STATE
+    random_state: int = RANDOM_STATE,
+    minority_count: int = 399,
+    cv_folds: int = CV_FOLDS,
 ) -> ImbPipeline:
     """
     Create a pipeline with optional scaling + SMOTE + classifier.
@@ -190,14 +192,19 @@ def create_smote_pipeline(
         model: Scikit-learn classifier instance.
         use_scaler: Whether to include StandardScaler.
         random_state: Random seed for reproducibility.
+        minority_count: Number of fraud samples in training data.
+        cv_folds: Number of cross-validation folds.
     
     Returns:
         Imbalanced-learn Pipeline.
     """
-    # Calculate appropriate k_neighbors based on minority class
-    # SMOTE needs at least k_neighbors+1 minority samples
-    minority_min = 399 // CV_FOLDS  # Approximate min samples per fold
-    k_neighbors = min(5, minority_min - 1) if minority_min > 1 else 1
+    # Calculate safe k_neighbors based on actual minority count per fold
+    # SMOTE needs at least k_neighbors+1 minority samples in each fold
+    minority_per_fold = minority_count // cv_folds
+    if minority_per_fold <= 1:
+        k_neighbors = 1
+    else:
+        k_neighbors = min(5, minority_per_fold - 1)
     k_neighbors = max(1, k_neighbors)
     
     steps = []
@@ -207,7 +214,7 @@ def create_smote_pipeline(
     
     steps.extend([
         ("smote", SMOTE(
-            sampling_strategy=0.3,  # FIX: Reduced from 0.5 to avoid excessive synthetic data
+            sampling_strategy=0.3,
             random_state=random_state,
             k_neighbors=k_neighbors,
         )),
@@ -525,6 +532,9 @@ def run_baseline_training(
     # Load data
     X, y, df, feature_names = load_training_data(train_path)
     
+    # Calculate actual fraud count for SMOTE k_neighbors safety
+    fraud_count = int(y.sum())
+    
     # Get models
     all_models = get_baseline_models(random_state)
     
@@ -553,8 +563,10 @@ def run_baseline_training(
             # Determine if scaling is needed
             use_scaler = model_name in models_needing_scaler
             
-            # Create SMOTE pipeline
-            pipeline = create_smote_pipeline(model, use_scaler, random_state)
+            # Create SMOTE pipeline with actual fraud count for safe k_neighbors
+            pipeline = create_smote_pipeline(
+                model, use_scaler, random_state, fraud_count, cv_folds
+            )
             
             # Cross-validation evaluation
             cv_metrics, cv_results = evaluate_model_cv(

@@ -30,6 +30,8 @@ paths:
   monitoring_report: "reports/monitoring_report"
   logs_dir: "logs"
   service_log: "logs/service.log"
+  processed_data_dir: "data/processed"     # ADD THIS
+  config_dir: "config"                     # ADD THIS
 
 # ================================
 # Data Ingestion

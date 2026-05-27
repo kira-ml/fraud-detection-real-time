@@ -133,7 +133,11 @@ def scale_features(
     scaler_type: str,
 ) -> Tuple[pd.DataFrame, object]:
     """
-    Scale specified features using the configured scaler type.
+    Scale specified features while PRESERVING raw values for downstream feature engineering.
+    
+    Creates {col}_raw columns before scaling so velocity, hour, and amount-based
+    features can use the original (unscaled) values. The scaled columns replace
+    the originals for model training.
     
     Args:
         df: Input DataFrame.
@@ -141,27 +145,38 @@ def scale_features(
         scaler_type: 'standard' for StandardScaler, 'robust' for RobustScaler.
     
     Returns:
-        Tuple of (DataFrame with scaled features, fitted scaler object).
+        Tuple of (DataFrame with scaled features + raw backups, fitted scaler object).
     """
     scaler = create_scaler(scaler_type)
     
     print(f"[PREPROCESS] Scaling features {feature_columns} using {scaler_type} scaler...")
     
+    df_scaled = df.copy()
+    
+    # Preserve raw values BEFORE scaling
+    for col in feature_columns:
+        if col in df_scaled.columns:
+            raw_col = f"{col}_raw"
+            df_scaled[raw_col] = df_scaled[col].copy()
+            print(f"[PREPROCESS]   Preserved {col} → {raw_col}")
+    
     # Extract features to scale
-    X = df[feature_columns].values
+    X = df_scaled[feature_columns].values
     
     # Fit and transform
     X_scaled = scaler.fit_transform(X)
     
-    # Replace in DataFrame
-    df_scaled = df.copy()
+    # Replace original columns with scaled values
     df_scaled[feature_columns] = X_scaled
     
     # Log scaling statistics
     for i, col in enumerate(feature_columns):
         mean_val = X_scaled[:, i].mean()
         std_val = X_scaled[:, i].std()
-        print(f"[PREPROCESS]   {col}: mean={mean_val:.4f}, std={std_val:.4f}")
+        raw_mean = df_scaled[f"{col}_raw"].mean()
+        raw_std = df_scaled[f"{col}_raw"].std()
+        print(f"[PREPROCESS]   {col} (scaled): mean={mean_val:.4f}, std={std_val:.4f}")
+        print(f"[PREPROCESS]   {col}_raw:       mean={raw_mean:.2f}, std={raw_std:.2f}")
     
     return df_scaled, scaler
 
