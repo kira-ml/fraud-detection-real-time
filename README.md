@@ -9,7 +9,7 @@ A production-minded machine learning system for detecting fraudulent credit card
 **Prediction Type:** Binary classification with calibrated probability scoring  
 **Pipeline:** End-to-end — ingest → validate → preprocess → split → feature engineer → train → evaluate → deploy → monitor
 
-![Model Comparison Dashboard](artifacts/plots/01_pr_curves.png)
+![Model Comparison Dashboard](plots/01_pr_curves.png)
 
 ---
 
@@ -183,11 +183,11 @@ Seven models were trained and evaluated on an honest, leakage-free time split (8
 
 **Feature engineering impact — engineered features dominate raw PCA.** `fraud_direction_score` (encoding domain knowledge that V17/V14/V12/V10/V16 are negatively correlated with fraud) is LightGBM's #1 feature. `fraud_feature_magnitude` is XGBoost's top feature at 28.9% importance. The top 5 LightGBM features are all either engineered interaction terms or domain-driven scores — none are raw PCA components. Temporal features (`hour_sin`, `time_since_last_txn`) and velocity features (`txn_count_10min`, `std_amount_24h`) appear in the top 15, confirming they carry signal when computed from raw seconds rather than scaled values.
 
-![Feature Importance](artifacts/plots/03_feature_importance.png)
+![Feature Importance](plots/03_feature_importance.png)
 
 **SHAP analysis reveals feature direction, not just importance.** High values of `V14_V10` strongly push predictions toward fraud, likely capturing a specific attack vector. `fraud_direction_score` shows a clean linear relationship — acting as a maliciousness score. High `V8` pushes predictions away from fraud, suggesting it captures normal high-value transaction patterns and acts as a whitelisting signal.
 
-![SHAP Summary](artifacts/plots/05_shap_summary.png)
+![SHAP Summary](plots/05_shap_summary.png)
 
 **Baseline vs. advanced trade-off:** Random Forest on 50 baseline features achieves a test PR-AUC of 0.7946 — only 0.002 above LightGBM on 80 features. However, RF generates 112 false alarms (0.15% FPR) compared to LightGBM's 19 (0.03% FPR). The advanced feature set doesn't dramatically improve recall — it dramatically improves precision. For deployment scenarios where model simplicity matters, RF offers a strong alternative; where operational cost dominates, LightGBM is the clear winner.
 
@@ -245,7 +245,7 @@ The decision threshold is configurable — different business scenarios demand d
 
 Even at the most conservative threshold (0.9), Logistic Regression generates 174 false alarms compared to LightGBM's 4. The advanced feature set doesn't just improve recall — it fundamentally changes the precision-recall tradeoff in a way that makes the model operationally viable at scale.
 
-![Threshold Tradeoff](artifacts/plots/04_threshold_tradeoff.png)
+![Threshold Tradeoff](plots/04_threshold_tradeoff.png)
 
 ---
 
