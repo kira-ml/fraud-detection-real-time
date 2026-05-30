@@ -1,5 +1,0 @@
-split_method: chronological_index
-train_ratio: 0.8
-train_size: 226980
-test_size: 56746
-note: Data is pre-sorted chronologically during feature engineering
